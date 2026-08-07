@@ -1,0 +1,1020 @@
+#!/usr/bin/env python3
+"""caf-art — a reactive ANSI coffee scene for `caf`.
+
+A procedurally drawn cup of coffee rendered with half-block characters at 2x
+vertical resolution, steam rendered in braille (2x4 dots per cell) driven by a
+curl-noise particle simulation, and a shallow-water height-field simulation for
+the liquid surface — sipping, stirring, refilling, and CPU heat all disturb the
+same physical surface. Only changed lines are re-emitted each frame, and the
+layout recomputes from the terminal size every frame.
+
+Interactive keys while running:
+  s      take a sip (refills with a pour animation when the cup runs low)
+  space  stir the coffee
+  w      steam writes the current time
+  t      cycle themes
+  q      quit (Ctrl+C also works)
+
+Flags:
+  --pomodoro N   the coffee IS the timer: drains over N minutes of work,
+                 rings and refills for a 5-minute break, repeats
+  --weather      fetch local weather once; rain/snow/sun ambience
+  --zen          screensaver mode: no status line, slow theme crossfades,
+                 occasional automatic stirs
+  --hires        render as real images via the kitty graphics protocol
+                 (Ghostty/kitty); falls back to ANSI elsewhere
+
+User themes: ~/.config/caf/themes.toml, e.g.
+  [mytheme]
+  icon = "🍫"
+  name = "Mocha"
+  cup = [180, 130, 90]
+  liquid = [60, 35, 20]
+  crema = [190, 150, 110]
+  steam = [235, 230, 225]
+  saucer = [140, 95, 60]
+
+Runs `caffeinate -d` for as long as it's on screen.
+"""
+
+import base64
+import math
+import os
+import random
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+import zlib
+
+# --------------------------------------------------------------------------
+# Themes
+# --------------------------------------------------------------------------
+
+THEMES = {
+    "classic": dict(
+        icon="☕", name="Classic",
+        cup=(235, 155, 52), liquid=(88, 52, 26), crema=(206, 152, 92),
+        steam=(240, 238, 232), saucer=(190, 120, 40), sparkle=None,
+    ),
+    "matcha": dict(
+        icon="\U0001f375", name="Matcha",
+        cup=(122, 196, 128), liquid=(126, 168, 62), crema=(196, 220, 140),
+        steam=(226, 244, 224), saucer=(92, 152, 98), sparkle=None,
+    ),
+    "cyber": dict(
+        icon="⚡", name="Cyber",
+        cup=(50, 216, 255), liquid=(8, 42, 64), crema=(0, 255, 214),
+        steam=(190, 240, 255), saucer=(30, 140, 190), sparkle=(120, 255, 240),
+    ),
+    "berry": dict(
+        icon="\U0001f496", name="Berry",
+        cup=(255, 110, 180), liquid=(148, 42, 92), crema=(255, 180, 214),
+        steam=(255, 228, 240), saucer=(200, 80, 140), sparkle=(255, 190, 230),
+    ),
+    "dark": dict(
+        icon="☕", name="Dark Roast",
+        cup=(152, 92, 44), liquid=(38, 22, 12), crema=(150, 104, 62),
+        steam=(216, 206, 196), saucer=(110, 66, 32), sparkle=None,
+    ),
+}
+ALIASES = {"green": "matcha", "blue": "cyber", "pink": "berry", "coffee": "dark"}
+COLOR_KEYS = ("cup", "liquid", "crema", "steam", "saucer")
+
+
+def load_user_themes():
+    path = os.path.expanduser("~/.config/caf/themes.toml")
+    if not os.path.exists(path):
+        return
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        for key, spec in data.items():
+            if not isinstance(spec, dict):
+                continue
+            theme = dict(THEMES["classic"])
+            theme["name"] = spec.get("name", key.title())
+            theme["icon"] = spec.get("icon", "☕")
+            theme["sparkle"] = tuple(spec["sparkle"]) if "sparkle" in spec else None
+            for ck in COLOR_KEYS:
+                if ck in spec:
+                    theme[ck] = tuple(int(v) for v in spec[ck])
+            THEMES[key.lower()] = theme
+    except Exception as e:
+        print(f"caf: ignoring ~/.config/caf/themes.toml ({e})", file=sys.stderr)
+
+
+TRUECOLOR = "truecolor" in os.environ.get("COLORTERM", "") or "24bit" in os.environ.get("COLORTERM", "")
+BG_COL = (18, 18, 22)   # assumed terminal background, used for hires + steam blending
+
+
+def q256(r, g, b):
+    def c(v):
+        return 0 if v < 48 else 1 if v < 114 else (v - 35) // 40
+    return 16 + 36 * c(r) + 6 * c(g) + c(b)
+
+
+def fg(col):
+    r, g, b = col
+    return f"\x1b[38;2;{r};{g};{b}m" if TRUECOLOR else f"\x1b[38;5;{q256(r, g, b)}m"
+
+
+def bg(col):
+    r, g, b = col
+    return f"\x1b[48;2;{r};{g};{b}m" if TRUECOLOR else f"\x1b[48;5;{q256(r, g, b)}m"
+
+
+def shade(col, k):
+    return (min(255, max(0, int(col[0] * k))),
+            min(255, max(0, int(col[1] * k))),
+            min(255, max(0, int(col[2] * k))))
+
+
+def mix(a, b, t):
+    return (int(a[0] + (b[0] - a[0]) * t),
+            int(a[1] + (b[1] - a[1]) * t),
+            int(a[2] + (b[2] - a[2]) * t))
+
+
+def blend_theme(a, b, f):
+    out = dict(b if f > 0.5 else a)
+    for k in COLOR_KEYS:
+        out[k] = mix(a[k], b[k], f)
+    out["sparkle"] = (b if f > 0.5 else a)["sparkle"]
+    return out
+
+
+# --------------------------------------------------------------------------
+# Curl noise (drives the steam wisps)
+# --------------------------------------------------------------------------
+
+def _h(i, j):
+    n = (i * 1619 + j * 31337) & 0xFFFFFFFF
+    n = ((n ^ (n >> 13)) * 1274126177) & 0xFFFFFFFF
+    return ((n ^ (n >> 16)) & 0xFFFF) / 65535.0
+
+
+def vnoise(x, y):
+    ix, iy = math.floor(x), math.floor(y)
+    fx, fy = x - ix, y - iy
+    u = fx * fx * (3 - 2 * fx)
+    v = fy * fy * (3 - 2 * fy)
+    a, b = _h(ix, iy), _h(ix + 1, iy)
+    c, d = _h(ix, iy + 1), _h(ix + 1, iy + 1)
+    return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v
+
+
+def curl(x, y, e=0.6):
+    dndy = (vnoise(x, y + e) - vnoise(x, y - e)) / (2 * e)
+    dndx = (vnoise(x + e, y) - vnoise(x - e, y)) / (2 * e)
+    return dndy, -dndx
+
+
+BRAILLE_BIT = ((0x01, 0x02, 0x04, 0x40), (0x08, 0x10, 0x20, 0x80))
+
+# 3x5 bitmap font for steam writing
+FONT = {
+    "0": ("111", "101", "101", "101", "111"),
+    "1": ("010", "110", "010", "010", "111"),
+    "2": ("111", "001", "111", "100", "111"),
+    "3": ("111", "001", "111", "001", "111"),
+    "4": ("101", "101", "111", "001", "001"),
+    "5": ("111", "100", "111", "001", "111"),
+    "6": ("111", "100", "111", "101", "111"),
+    "7": ("111", "001", "010", "010", "010"),
+    "8": ("111", "101", "111", "101", "111"),
+    "9": ("111", "101", "111", "001", "111"),
+    ":": ("000", "010", "000", "010", "000"),
+    "B": ("110", "101", "110", "101", "110"),
+    "R": ("110", "101", "110", "101", "101"),
+    "E": ("111", "100", "110", "100", "111"),
+    "A": ("010", "101", "111", "101", "101"),
+    "K": ("101", "110", "100", "110", "101"),
+    "G": ("111", "100", "101", "101", "111"),
+    "O": ("111", "101", "101", "101", "111"),
+    " ": ("000", "000", "000", "000", "000"),
+}
+
+
+# --------------------------------------------------------------------------
+# Shallow-water surface simulation
+# --------------------------------------------------------------------------
+
+WGW, WGH = 54, 26
+
+
+class Water:
+    """Height-field wave sim on an elliptical grid; walls reflect."""
+
+    def __init__(self):
+        self.h = [[0.0] * WGW for _ in range(WGH)]
+        self.v = [[0.0] * WGW for _ in range(WGH)]
+        self.mask = [[False] * WGW for _ in range(WGH)]
+        for gy in range(WGH):
+            for gx in range(WGW):
+                u = gx / (WGW - 1) * 2 - 1
+                w = gy / (WGH - 1) * 2 - 1
+                self.mask[gy][gx] = u * u + w * w <= 1.0
+
+    def step(self):
+        h, v, mask = self.h, self.v, self.mask
+        for gy in range(WGH):
+            hrow, vrow, mrow = h[gy], v[gy], mask[gy]
+            up = h[gy - 1] if gy > 0 else hrow
+            dn = h[gy + 1] if gy < WGH - 1 else hrow
+            for gx in range(WGW):
+                if not mrow[gx]:
+                    continue
+                c = hrow[gx]
+                # out-of-mask neighbors mirror the cell -> reflecting wall
+                left = hrow[gx - 1] if gx > 0 and mrow[gx - 1] else c
+                right = hrow[gx + 1] if gx < WGW - 1 and mrow[gx + 1] else c
+                above = up[gx] if mask[gy - 1][gx] and gy > 0 else c
+                below = dn[gx] if gy < WGH - 1 and mask[gy + 1][gx] else c
+                force = (left + right + above + below) / 4 - c
+                vrow[gx] = (vrow[gx] + force * 0.55) * 0.985
+        for gy in range(WGH):
+            hrow, vrow, mrow = h[gy], v[gy], mask[gy]
+            for gx in range(WGW):
+                if mrow[gx]:
+                    hrow[gx] = (hrow[gx] + vrow[gx]) * 0.999
+
+    def disturb(self, u, w, amp, rad=0.14):
+        cx = (u + 1) / 2 * (WGW - 1)
+        cy = (w + 1) / 2 * (WGH - 1)
+        r = max(1, int(rad * WGW))
+        for gy in range(max(0, int(cy) - r), min(WGH, int(cy) + r + 1)):
+            for gx in range(max(0, int(cx) - r), min(WGW, int(cx) + r + 1)):
+                if self.mask[gy][gx]:
+                    d2 = ((gx - cx) / r) ** 2 + ((gy - cy) / r) ** 2
+                    if d2 < 1:
+                        self.h[gy][gx] += amp * math.exp(-d2 * 3)
+
+    def sample(self, u, w):
+        gx = min(WGW - 1.001, max(0.0, (u + 1) / 2 * (WGW - 1)))
+        gy = min(WGH - 1.001, max(0.0, (w + 1) / 2 * (WGH - 1)))
+        ix, iy = int(gx), int(gy)
+        fx, fy = gx - ix, gy - iy
+        h = self.h
+        a = h[iy][ix] + (h[iy][ix + 1] - h[iy][ix]) * fx
+        b = h[iy + 1][ix] + (h[iy + 1][ix + 1] - h[iy + 1][ix]) * fx
+        return a + (b - a) * fy
+
+
+# --------------------------------------------------------------------------
+# Scene
+# --------------------------------------------------------------------------
+
+class Scene:
+    def __init__(self, theme_key, hires_scale=0):
+        self.theme_key = theme_key
+        self.theme = THEMES[theme_key]
+        self.S = hires_scale            # 0 = ANSI mode, >0 = px per cell width
+        self.particles = []             # [x, y, phase, age, life] in layout coords
+        self.sparkles = []
+        self.precip = []                # [x, y, vx, vy] rain/snow
+        self.t = 0.0
+        self.level = 1.0
+        self.target_level = 1.0
+        self.sips = 0
+        self.stir_t = -99.0
+        self.wind = 0.0
+        self.heat = 0.0
+        self._heat_at = 0.0
+        self.weather = None
+        self.water = Water()
+        self.word = None                # dict(pairs=[(particle, tx, ty)], until=t)
+
+    # ---- events ----------------------------------------------------------
+
+    def cycle_theme(self):
+        keys = list(THEMES)
+        self.theme_key = keys[(keys.index(self.theme_key) + 1) % len(keys)]
+        self.theme = THEMES[self.theme_key]
+        self.sparkles = []
+
+    def sip(self, pomo=False):
+        self.sips += 1
+        self.water.disturb(0.0, 0.75, -0.55, 0.2)
+        if not pomo:
+            if self.target_level <= 0.3:
+                self.target_level = 1.0
+            else:
+                self.target_level = max(0.18, self.target_level - 0.27)
+
+    def stir(self):
+        self.stir_t = self.t
+
+    def gust(self, cols_delta):
+        self.wind = max(-6.0, min(6.0, cols_delta * 0.4))
+
+    def write_word(self, text):
+        """Steam particles converge to spell `text` above the cup, then dissolve."""
+        text = "".join(ch for ch in text.upper() if ch in FONT) or "?"
+        avail = max(8, self.cup_top * 2 - 6)
+        k = max(1, min(4, (self.cup_w * 2 - 4) // (len(text) * 4),
+                       avail // 8))
+        w_dots = len(text) * 4 * k - k
+        x0 = self.cx * 2 - w_dots // 2
+        y0 = max(2, int(self.cup_top * 2 * 0.42) - (5 * k) // 2)
+        targets = []
+        for ci, ch in enumerate(text):
+            for ry, rowbits in enumerate(FONT[ch]):
+                for rx, bit in enumerate(rowbits):
+                    if bit == "1":
+                        for sy in range(k):
+                            for sx in range(k):
+                                targets.append((x0 + (ci * 4 + rx) * k + sx,
+                                                y0 + ry * k + sy))
+        if len(targets) > 420:
+            targets = random.sample(targets, 420)
+        pool = sorted(self.particles, key=lambda p: p[3])       # youngest first
+        pairs = []
+        for i, (bx, by) in enumerate(targets):
+            if i < len(pool):
+                p = pool[i]
+            else:
+                p = [self.cx + random.gauss(0, self.cup_w * 0.2),
+                     float(self.cup_top + self.rim_h // 2),
+                     random.uniform(0, math.tau), 0.0, self.cup_top * 1.0]
+                self.particles.append(p)
+            pairs.append((p, bx / 2, by / 2))
+        self.word = dict(pairs=pairs, until=self.t + 3.2)
+
+    # ---- layout ----------------------------------------------------------
+
+    def layout(self, cols, rows):
+        self.cols, self.rows = cols, rows
+        self.W = cols
+        self.H = (rows - 1) * 2
+        cup_h = max(8, min(40 * max(1, self.S), int(self.H * 0.42)))
+        cup_w = int(cup_h * 1.7)
+        max_w = self.W - max(10, self.W // 6)
+        if cup_w > max_w:
+            cup_w = max_w
+            cup_h = max(8, int(cup_w / 1.7))
+        self.cup_w, self.cup_h = cup_w, cup_h
+        self.saucer_h = max(3, cup_h // 8)
+        self.cx = self.W // 2 - max(2, cup_w // 10)
+        self.cup_bot = self.H - 2 - self.saucer_h
+        self.cup_top = self.cup_bot - cup_h
+        self.rim_h = max(3, cup_h // 5)
+        self.steam_by = max(2, (self.cup_top + self.rim_h) * 2)
+
+    # ---- simulation ------------------------------------------------------
+
+    def _sample_heat(self):
+        try:
+            self.heat = min(1.0, os.getloadavg()[0] / max(1, os.cpu_count() or 1))
+        except OSError:
+            self.heat = 0.3
+
+    def step(self, dt):
+        t = self.t
+        if t - self._heat_at > 1.0:
+            self._heat_at = t
+            self._sample_heat()
+        pouring = self.target_level - self.level > 0.04
+        self.level += (self.target_level - self.level) * min(1.0, dt * (1.2 if pouring else 2.5))
+        self.wind *= math.exp(-dt * 1.2)
+
+        # --- water surface ---
+        w = self.water
+        w.step()
+        if random.random() < 0.25 + self.heat * 0.5:            # thermal jitter
+            w.disturb(random.uniform(-0.7, 0.7), random.uniform(-0.7, 0.7),
+                      random.uniform(0.008, 0.02 + 0.08 * self.heat), 0.08)
+        if self.heat > 0.45 and random.random() < (self.heat - 0.4) * 0.9:
+            w.disturb(random.uniform(-0.5, 0.5), random.uniform(-0.5, 0.5), 0.3, 0.06)  # boil bubble
+        stir_age = t - self.stir_t
+        if 0 <= stir_age < 1.3:                                  # orbiting spoon
+            ang = stir_age * 9.0
+            w.disturb(math.cos(ang) * 0.55, math.sin(ang) * 0.55, 0.35, 0.1)
+        if pouring:
+            w.disturb(-0.15, -0.2, random.uniform(0.15, 0.4), 0.09)
+
+        # --- steam particles ---
+        heat_k = 0.5 + 0.9 * self.heat
+        rate = max(2, int((self.cup_w // 5) * (0.25 + 0.75 * self.level) * heat_k))
+        for _ in range(rate):
+            if random.random() < 0.65:
+                k = random.randrange(3)
+                plume = self.cx + math.sin(t * 0.6 + k * 2.1) * self.cup_w * 0.24
+                self.particles.append([plume + random.gauss(0, 1.2),
+                                       float(self.cup_top + self.rim_h // 2),
+                                       random.uniform(0, math.tau), 0.0,
+                                       random.uniform(0.7, 1.05) * self.cup_top])
+
+        word_set = set()
+        if self.word:
+            if t > self.word["until"]:
+                for p, _, _ in self.word["pairs"]:
+                    p[3] = min(p[3], p[4] * 0.35)
+                self.word = None
+            else:
+                ease = min(1.0, dt * 5)
+                for p, tx, ty in self.word["pairs"]:
+                    p[0] += (tx - p[0]) * ease
+                    p[1] += (ty - p[1]) * ease
+                    word_set.add(id(p))
+
+        alive = []
+        top = max(1, self.cup_top)
+        speed = 1.0 + 0.5 * self.heat
+        for p in self.particles:
+            if id(p) in word_set:
+                alive.append(p)
+                continue
+            s = 6 + 22 * max(0.0, 1 - p[1] / top)
+            nx, ny = curl(p[0] * 0.08 / max(1, self.S), p[1] * 0.08 / max(1, self.S), )
+            sc = max(1, self.S)
+            p[0] += (nx * s * sc + math.sin(t * 0.5) * 1.2 * sc + self.wind * 6 * sc * 0.1) * dt * 2.2
+            p[1] -= (13 + 7 * math.sin(p[2]) - ny * s * 0.6) * dt * 1.35 * sc * speed
+            p[3] += dt * 22
+            if p[3] < p[4] and p[1] > 1:
+                alive.append(p)
+        self.particles = alive
+
+        # --- weather ---
+        sc = max(1, self.S)
+        if self.weather == "rain":
+            for _ in range(max(1, self.W // 40)):
+                if random.random() < 0.7:
+                    self.precip.append([random.uniform(0, self.W), 0.0, 0.35 * sc, 26.0 * sc])
+        elif self.weather == "snow":
+            if random.random() < 0.5:
+                self.precip.append([random.uniform(0, self.W), 0.0,
+                                    random.uniform(-1, 1) * sc, 5.0 * sc])
+        keep = []
+        for q in self.precip:
+            q[0] += (q[2] + (math.sin(t * 0.8 + q[1] * 0.3) * 0.8 * sc if self.weather == "snow" else 0)) * dt
+            q[1] += q[3] * dt
+            if q[1] * 2 < self.steam_by and 0 <= q[0] < self.W:
+                keep.append(q)
+        self.precip = keep
+
+        if self.theme["sparkle"] and not self.S:
+            if random.random() < 0.18:
+                self.sparkles.append([random.randint(2, self.cols - 3),
+                                      random.randint(1, max(2, self.cup_top // 2 - 1)), 0])
+            self.sparkles = [[c, r, a + 1] for c, r, a in self.sparkles if a < 7]
+
+    # ---- drawing ---------------------------------------------------------
+
+    def draw(self):
+        W, H = self.W, self.H
+        px = [[None] * W for _ in range(H)]
+        th = self.theme
+        t = self.t
+        cx, cup_w, cup_h = self.cx, self.cup_w, self.cup_h
+        top, bot, rim_h = self.cup_top, self.cup_bot, self.rim_h
+        hw0 = cup_w / 2
+
+        # sun halo: a warm static glow behind the cup
+        if self.weather == "sun":
+            hcy = top + cup_h * 0.35
+            rx, ry = cup_w * 0.95, cup_h * 1.15
+            for y in range(max(0, int(hcy - ry)), min(H, int(hcy + ry) + 1)):
+                for x in range(max(0, int(cx - rx)), min(W, int(cx + rx) + 1)):
+                    d = ((x - cx) / rx) ** 2 + ((y - hcy) / ry) ** 2
+                    if d < 1:
+                        px[y][x] = mix(BG_COL, (120, 84, 30), (1 - d) * 0.5)
+
+        # saucer
+        s_w = cup_w * 1.5
+        for j in range(self.saucer_h):
+            tt = j / max(1, self.saucer_h - 1)
+            hw = (s_w / 2) * math.sqrt(max(0.0, 1 - (tt * 0.85) ** 2))
+            y = bot + j
+            if y >= H:
+                break
+            for x in range(int(cx - hw), int(cx + hw) + 1):
+                if 0 <= x < W:
+                    k = 0.9 - 0.45 * tt + 0.25 * math.exp(-((x - cx + hw * 0.3) / (hw * 0.45 + 1)) ** 2)
+                    px[y][x] = shade(th["saucer"], k)
+
+        # cup body
+        for j in range(rim_h // 2, cup_h + 1):
+            tt = j / cup_h
+            hw = hw0 * (1 - 0.16 * tt)
+            if tt > 0.78:
+                hw *= math.sqrt(max(0.0, 1 - ((tt - 0.78) / 0.24) ** 2))
+            y = top + j
+            if not (0 <= y < H) or hw < 1:
+                continue
+            for x in range(int(cx - hw), int(cx + hw) + 1):
+                if 0 <= x < W:
+                    u = max(-1.0, min(1.0, (x - cx) / (hw + 1e-6)))
+                    k = 0.52 + 0.30 * (1 - abs(u)) ** 0.7
+                    k += 0.34 * math.exp(-((u + 0.45) / 0.28) ** 2)
+                    k -= 0.18 * max(0.0, u - 0.55)
+                    k *= 1.0 - 0.22 * tt
+                    px[y][x] = shade(th["cup"], k)
+
+        # handle
+        hr = max(3, int(cup_h * 0.30))
+        hcx, hcy = cx + hw0 * 0.92, top + cup_h * 0.45
+        thick = max(1.4, cup_h * 0.07)
+        for y in range(int(hcy - hr - thick), int(hcy + hr + thick) + 1):
+            for x in range(int(hcx), int(hcx + hr + thick) + 1):
+                if not (0 <= x < W and 0 <= y < H):
+                    continue
+                d = math.hypot((x - hcx) * 0.78, y - hcy)
+                if abs(d - hr) <= thick and x >= hcx + 1:
+                    k = 0.55 + 0.3 * (1 - abs(d - hr) / thick)
+                    if px[y][x] is None or self.weather == "sun":
+                        px[y][x] = shade(th["cup"], k)
+
+        # rim + liquid: the water sim provides height + slope lighting
+        ls = 0.45 + 0.55 * self.level
+        voff = (1 - self.level) * 0.30
+        wsamp = self.water.sample
+        for j in range(rim_h + 1):
+            v = (j - rim_h / 2) / (rim_h / 2 + 1e-6)
+            hw = hw0 * math.sqrt(max(0.0, 1 - v * v))
+            y = top + j
+            if not (0 <= y < H) or hw < 1:
+                continue
+            for x in range(int(cx - hw), int(cx + hw) + 1):
+                if not (0 <= x < W):
+                    continue
+                u = (x - cx) / (hw + 1e-6)
+                if abs(u) > 0.86 or j == 0:
+                    px[y][x] = shade(th["cup"], 1.05 - 0.25 * abs(u))
+                    continue
+                lu = u / (0.86 * ls)
+                lv = (v - voff) / max(0.35, ls)
+                if lu * lu + lv * lv > 1.0:
+                    px[y][x] = shade(th["cup"], 0.30 + 0.08 * v)
+                    continue
+                hgt = wsamp(lu, lv)
+                slope = (wsamp(lu + 0.09, lv) - hgt) + (wsamp(lu, lv + 0.09) - hgt)
+                bright = 0.16 + hgt * 1.5 + slope * 3.2
+                col = mix(th["liquid"], th["crema"], max(0.0, min(0.85, bright)))
+                d = math.hypot(lu * 2.2, lv * 1.4)
+                if d > 1.15:
+                    col = mix(col, th["crema"], 0.35)
+                gl = math.exp(-((lu + 0.35) ** 2 + (lv + 0.3) ** 2) / 0.18)
+                col = mix(col, (255, 255, 255), 0.10 * gl)
+                px[y][x] = col
+
+        # pour stream while refilling
+        sc = th["steam"]
+        if self.target_level - self.level > 0.04:
+            stream_x = cx - cup_w * 0.07
+            liq_col = th["liquid"]
+            for y in range(0, top + rim_h // 2):
+                wob = math.sin(t * 6 + y * 0.4) * 0.8
+                for dx in (0, 1):
+                    xi = int(stream_x + wob) + dx
+                    if 0 <= xi < W:
+                        px[y][xi] = mix(liq_col, sc, 0.25)
+
+        # steam + precip
+        sgrid = [[0.0] * (W * 2) for _ in range(self.steam_by)] if not self.S else None
+        if self.S:
+            self._splat_hires(px)
+        else:
+            self._splat_braille(px, sgrid)
+        return px, sgrid
+
+    def _splat_braille(self, px, sgrid):
+        W, H = self.W, self.H
+        sc = self.theme["steam"]
+        bw = W * 2
+        for x, y, ph, age, life in self.particles:
+            a = max(0.0, 1 - age / life) ** 1.3 * 0.95
+            spread = 1 + int((1 - a) * 2)
+            bx, by = int(x * 2), int(y * 2)
+            for dx, dy, w in ((0, 0, 1.0), (-1, 0, 0.55), (1, 0, 0.55),
+                              (0, -1, 0.5), (0, 1, 0.35),
+                              (-1, -1, 0.3), (1, -1, 0.3), (-1, 1, 0.22), (1, 1, 0.22),
+                              (-2, 0, 0.15), (2, 0, 0.15)):
+                xi, yi = bx + dx * spread, by + dy
+                if 0 <= xi < bw and 0 <= yi < self.steam_by:
+                    sgrid[yi][xi] += a * w
+            pyi, pxi = int(y), int(x)
+            if 0 <= pxi < W and 0 <= pyi < H and px[pyi][pxi] is not None:
+                px[pyi][pxi] = mix(px[pyi][pxi], sc, min(1.0, a * 0.55))
+        for qx, qy, _, vy in self.precip:
+            bx, by = int(qx * 2), int(qy * 2)
+            if 0 <= bx < bw and 0 <= by < self.steam_by:
+                sgrid[by][bx] += 0.5
+                if self.weather == "rain" and by + 1 < self.steam_by:
+                    sgrid[by + 1][bx] += 0.3
+
+    def _splat_hires(self, px):
+        W, H = self.W, self.H
+        S = self.S
+        sc = self.theme["steam"]
+        for x, y, ph, age, life in self.particles:
+            a = max(0.0, 1 - age / life) ** 1.3 * 0.95
+            R = max(1, int(S * 0.5 + (1 - a) * S * 0.9))
+            xi0, yi0 = int(x), int(y)
+            for dy in range(-R, R + 1):
+                yi = yi0 + dy
+                if not (0 <= yi < H):
+                    continue
+                row = px[yi]
+                for dx in range(-R, R + 1):
+                    d2 = dx * dx + dy * dy
+                    if d2 > R * R:
+                        continue
+                    xi = xi0 + dx
+                    if not (0 <= xi < W):
+                        continue
+                    w = a * (1 - 0.7 * math.sqrt(d2) / R) * 0.55
+                    base = row[xi] if row[xi] is not None else BG_COL
+                    row[xi] = mix(base, sc, min(1.0, w))
+        pc = (150, 170, 220) if self.weather == "rain" else (235, 235, 240)
+        for qx, qy, _, _ in self.precip:
+            xi, yi = int(qx), int(qy)
+            if 0 <= xi < W and 0 <= yi < H and px[yi][xi] is None:
+                px[yi][xi] = pc
+
+    # ---- blit: buffers -> terminal lines (ANSI mode) ---------------------
+
+    def blit(self, px, sgrid):
+        out = []
+        sc = self.theme["steam"]
+        steam_cell_rows = self.steam_by // 4 + 1
+        for row in range(self.rows - 1):
+            top, bot = px[2 * row], px[2 * row + 1]
+            line = []
+            last_fg = object(); last_bg = object()
+            for x in range(self.W):
+                a, b = top[x], bot[x]
+                if a is None and b is None:
+                    if row < steam_cell_rows:
+                        bits = 0
+                        total = 0.0
+                        lit = 0
+                        for dx in (0, 1):
+                            gx = x * 2 + dx
+                            for dy in range(4):
+                                gy = row * 4 + dy
+                                if gy < self.steam_by:
+                                    val = sgrid[gy][gx]
+                                    if val > 0.12:
+                                        bits |= BRAILLE_BIT[dx][dy]
+                                        total += val
+                                        lit += 1
+                        if bits:
+                            col = mix((0, 0, 0), sc, min(1.0, (total / lit) * 1.25))
+                            if col != last_fg:
+                                line.append(fg(col)); last_fg = col
+                            if last_bg is not None:
+                                line.append("\x1b[49m"); last_bg = None
+                            line.append(chr(0x2800 | bits))
+                            continue
+                    if last_fg is not None or last_bg is not None:
+                        line.append("\x1b[0m")
+                        last_fg = last_bg = None
+                    line.append(" ")
+                elif a is not None and b is not None:
+                    if a != last_fg:
+                        line.append(fg(a)); last_fg = a
+                    if b != last_bg:
+                        line.append(bg(b)); last_bg = b
+                    line.append("▀")
+                elif a is not None:
+                    if last_bg is not None:
+                        line.append("\x1b[49m"); last_bg = None
+                    if a != last_fg:
+                        line.append(fg(a)); last_fg = a
+                    line.append("▀")
+                else:
+                    if last_bg is not None:
+                        line.append("\x1b[49m"); last_bg = None
+                    if b != last_fg:
+                        line.append(fg(b)); last_fg = b
+                    line.append("▄")
+            line.append("\x1b[0m\x1b[K")
+            out.append("".join(line))
+
+        overlay = []
+        for c, r, age in self.sparkles:
+            if 0 <= r < len(out):
+                ch = "✦" if age < 4 else "·"
+                overlay.append(f"\x1b[{r + 1};{c + 1}H{fg(self.theme['sparkle'])}{ch}\x1b[0m")
+        return out, "".join(overlay)
+
+    def status(self, elapsed, interactive, extra="", zen=False, width=None):
+        if zen:
+            return ""
+        width = width or self.cols
+        th = self.theme
+        m, s = divmod(int(elapsed), 60)
+        h, m = divmod(m, 60)
+        clock = f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        n = round(self.level * 4)
+        cup_bar = "▇" * n + "░" * (4 - n)
+        hn = min(3, int(self.heat * 3 + 0.5))
+        heat_bar = "▂▄▆"[:hn] or "·"
+        keys = " · [s]ip [␣]stir [w]rite [t]heme [q]uit" if interactive else " · Ctrl+C to stop"
+        text = f" {th['icon']}  {th['name']} · awake {clock} · cup {cup_bar} · heat {heat_bar}{extra}{keys} "
+        if len(text) > width:
+            text = f" {th['icon']} {clock} {cup_bar}{extra} "
+        pad = max(0, (width - len(text)) // 2)
+        return " " * pad + f"\x1b[2m{text}\x1b[0m"
+
+
+# --------------------------------------------------------------------------
+# Kitty graphics output (--hires)
+# --------------------------------------------------------------------------
+
+def encode_png(w, h, rows):
+    """rows: list of bytes objects, each 3*w RGB bytes."""
+    def chunk(tag, data):
+        c = tag + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c))
+    raw = b"".join(b"\x00" + r for r in rows)
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6))
+            + chunk(b"IEND", b""))
+
+
+def kitty_emit(png, cols, rows_cells):
+    b64 = base64.standard_b64encode(png).decode()
+    parts = ["\x1b[H"]
+    step = 4096
+    for i in range(0, len(b64), step):
+        last = i + step >= len(b64)
+        ctl = f"m={0 if last else 1}"
+        if i == 0:
+            ctl = f"a=T,f=100,i=99,p=1,q=2,c={cols},r={rows_cells}," + ctl
+        parts.append(f"\x1b_G{ctl};{b64[i:i + step]}\x1b\\")
+    return "".join(parts)
+
+
+def px_to_png(px, W, H):
+    bgb = bytes(BG_COL)
+    rows = []
+    for y in range(H):
+        row = bytearray()
+        for c in px[y]:
+            row += bytes(c) if c is not None else bgb
+        rows.append(bytes(row))
+    return encode_png(W, H, rows)
+
+
+# --------------------------------------------------------------------------
+# Weather
+# --------------------------------------------------------------------------
+
+def fetch_weather(scene):
+    def run():
+        try:
+            import urllib.request
+            with urllib.request.urlopen("https://wttr.in/?format=%C", timeout=3) as r:
+                cond = r.read().decode(errors="ignore").lower()
+            if any(k in cond for k in ("rain", "drizzle", "shower", "thunder")):
+                scene.weather = "rain"
+            elif "snow" in cond or "sleet" in cond or "blizzard" in cond:
+                scene.weather = "snow"
+            elif "sun" in cond or "clear" in cond:
+                scene.weather = "sun"
+        except Exception:
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+# --------------------------------------------------------------------------
+# Main loop
+# --------------------------------------------------------------------------
+
+def usage():
+    print("\x1b[1mUsage:\x1b[0m caf [preset] [--pomodoro N] [--weather] [--zen] [--hires]")
+    print("\x1b[1mPresets:\x1b[0m " + ", ".join(THEMES) + "  (aliases: " + ", ".join(ALIASES) + ")")
+    print("\x1b[1mKeys:\x1b[0m s = sip, space = stir, w = write the time, t = theme, q = quit")
+    print("\x1b[1mThemes file:\x1b[0m ~/.config/caf/themes.toml")
+
+
+def main():
+    load_user_themes()
+    args = list(sys.argv[1:])
+    demo_frames = 0
+    demo_size = None
+    no_caf = False
+    preset = "classic"
+    pomo_min = 0
+    zen = False
+    hires = False
+    weather = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("help", "-h", "--help"):
+            usage(); return 0
+        elif a == "--demo":
+            demo_frames = int(args[i + 1]); i += 1
+        elif a == "--size":
+            w, h = args[i + 1].split("x"); demo_size = (int(w), int(h)); i += 1
+        elif a == "--no-caffeinate":
+            no_caf = True
+        elif a in ("--pomodoro", "pomo"):
+            pomo_min = int(args[i + 1]); i += 1
+        elif a == "--zen":
+            zen = True
+        elif a == "--hires":
+            hires = True
+        elif a == "--weather":
+            weather = True
+        else:
+            preset = ALIASES.get(a, a)
+        i += 1
+    if preset not in THEMES:
+        preset = "classic"
+
+    caf_proc = None
+    if not no_caf and not demo_frames and shutil.which("caffeinate"):
+        caf_proc = subprocess.Popen(["caffeinate", "-d"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    interactive = demo_frames == 0
+    keyboard = interactive and sys.stdin.isatty()
+    S = 4 if hires else 0
+    scene = Scene(preset, hires_scale=S)
+    scene._sample_heat()
+    if weather:
+        fetch_weather(scene)
+    start = time.monotonic()
+
+    pomo_phase = "work"
+    pomo_end = start + pomo_min * 60 if pomo_min else None
+    zen_switch = start + 150
+    zen_fade = None      # (from_theme, to_key, t0)
+
+    old_termios = None
+    if keyboard:
+        import termios
+        import tty
+        stdin_fd = sys.stdin.fileno()
+        old_termios = termios.tcgetattr(stdin_fd)
+        tty.setcbreak(stdin_fd)
+
+    def cleanup():
+        if caf_proc:
+            caf_proc.terminate()
+        if old_termios is not None:
+            import termios
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_termios)
+        if interactive:
+            sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
+
+    if interactive:
+        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+
+    last_size = None
+    frame_n = 0
+    prev_lines = None
+    prev_status = None
+    prev_sparkle_rows = set()
+    last_word_stamp = None
+    try:
+        while True:
+            now = time.monotonic()
+            cols, rows = (demo_size or shutil.get_terminal_size())
+            cols, rows = max(20, cols), max(8, rows)
+            if (cols, rows) != last_size:
+                if last_size:
+                    scene.gust(cols - last_size[0])
+                if S:
+                    scene.layout(cols * S, (rows - 1) * S + 1)
+                else:
+                    scene.layout(cols, rows)
+                last_size = (cols, rows)
+                prev_lines = prev_status = None
+                if interactive:
+                    sys.stdout.write("\x1b[2J")
+                scene.particles = [p for p in scene.particles
+                                   if p[1] < scene.cup_top + scene.rim_h]
+
+            if keyboard and select.select([sys.stdin], [], [], 0)[0]:
+                for ch in os.read(sys.stdin.fileno(), 64).decode(errors="ignore"):
+                    if ch == "s":
+                        scene.sip(pomo=bool(pomo_end))
+                    elif ch == " ":
+                        scene.stir()
+                    elif ch == "w":
+                        scene.write_word(time.strftime("%H:%M"))
+                    elif ch == "t":
+                        scene.cycle_theme()
+                        prev_lines = prev_status = None
+                    elif ch == "q":
+                        raise KeyboardInterrupt
+
+            if cols < 26 or rows < 10:
+                if interactive:
+                    msg = f"{scene.theme['icon']} zzz… (terminal too small, still caffeinated)"
+                    sys.stdout.write(f"\x1b[H\x1b[2J\x1b[{rows // 2};1H" + msg[:cols].center(cols))
+                    sys.stdout.flush()
+                    time.sleep(0.5)
+                    scene.t += 0.5
+                    prev_lines = prev_status = None
+                    continue
+
+            # pomodoro drives the level
+            extra = ""
+            if pomo_end:
+                rem = pomo_end - now
+                if rem <= 0:
+                    sys.stdout.write("\a")
+                    if pomo_phase == "work":
+                        pomo_phase = "break"
+                        pomo_end = now + 5 * 60
+                        scene.write_word("BREAK")
+                    else:
+                        pomo_phase = "work"
+                        pomo_end = now + pomo_min * 60
+                        scene.write_word("GO")
+                    rem = pomo_end - now
+                total = 5 * 60 if pomo_phase == "break" else pomo_min * 60
+                frac = max(0.0, min(1.0, rem / total))
+                scene.target_level = max(0.05, frac if pomo_phase == "work" else 1 - frac)
+                pm, ps = divmod(int(rem), 60)
+                extra = f" · \U0001f345 {pomo_phase} {pm:02d}:{ps:02d}"
+            elif not zen and not scene.word:
+                # steam writes the time every 10 minutes
+                lt = time.localtime()
+                stamp = (lt.tm_hour, lt.tm_min)
+                if lt.tm_min % 10 == 0 and lt.tm_sec < 2 and stamp != last_word_stamp:
+                    last_word_stamp = stamp
+                    scene.write_word(time.strftime("%H:%M"))
+
+            # zen: slow theme crossfade + occasional auto-stir
+            if zen:
+                if zen_fade is None and now > zen_switch:
+                    keys = list(THEMES)
+                    nxt = keys[(keys.index(scene.theme_key) + 1) % len(keys)]
+                    zen_fade = (dict(scene.theme), nxt, now)
+                if zen_fade:
+                    f = (now - zen_fade[2]) / 3.0
+                    if f >= 1:
+                        scene.theme_key = zen_fade[1]
+                        scene.theme = THEMES[zen_fade[1]]
+                        zen_fade = None
+                        zen_switch = now + 150
+                        prev_lines = None
+                    else:
+                        scene.theme = blend_theme(zen_fade[0], THEMES[zen_fade[1]], f)
+                if random.random() < 0.0005:
+                    scene.stir()
+
+            dt = 0.1 if S else 0.066
+            scene.t += dt
+            scene.step(dt)
+            px, sgrid = scene.draw()
+            status = scene.status(now - start, keyboard, extra, zen, width=cols)
+
+            if S:
+                png = px_to_png(px, scene.W, scene.H)
+                buf = kitty_emit(png, cols, rows - 1)
+                if status != prev_status:
+                    buf += f"\x1b[{rows};1H\x1b[2K{status}"
+                prev_status = status
+            else:
+                lines, overlay = scene.blit(px, sgrid)
+                if prev_lines is None or not interactive:
+                    buf = "\x1b[H" + "\n".join(lines) + "\n" + status + overlay
+                else:
+                    parts = []
+                    for idx, line in enumerate(lines):
+                        if idx >= len(prev_lines) or prev_lines[idx] != line or idx in prev_sparkle_rows:
+                            parts.append(f"\x1b[{idx + 1};1H{line}")
+                    if status != prev_status:
+                        parts.append(f"\x1b[{rows};1H\x1b[2K{status}")
+                    parts.append(overlay)
+                    buf = "".join(parts)
+                prev_lines, prev_status = lines, status
+                prev_sparkle_rows = {r for _, r, _ in scene.sparkles}
+            sys.stdout.write(buf)
+            sys.stdout.flush()
+
+            frame_n += 1
+            if demo_frames and frame_n >= demo_frames:
+                print()
+                return 0
+            time.sleep(dt)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cleanup()
+    m, s = divmod(int(time.monotonic() - start), 60)
+    extra = f", {scene.sips} sip{'s' if scene.sips != 1 else ''}" if scene.sips else ""
+    print(f"\x1b[1;31m \U0001f6d1 Decaffeinated.\x1b[0m \x1b[2m(awake for {m}m {s:02d}s{extra})\x1b[0m")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
