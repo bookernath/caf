@@ -382,6 +382,204 @@ def render3d(scene):
 
 
 # --------------------------------------------------------------------------
+# IMU: the hidden accelerometer/gyro in Apple Silicon MacBooks (M2+)
+# --------------------------------------------------------------------------
+# The SPU (Sensor Processing Unit) exposes a real MEMS IMU as AppleSPUHIDDevice
+# HID services (credit: github.com/olvvier/apple-silicon-accelerometer for the
+# report format). Opening the device needs root, so a small bridge process
+# (`sudo caf-art --imu-bridge`) streams samples to IMU_PATH; the unprivileged
+# renderer auto-detects fresh samples and turns real laptop motion into
+# physics: tilt slants the coffee, shoves slosh it, the gyro spins the camera.
+
+IMU_PATH = "/tmp/caf-imu.dat"
+IMU_FMT = "<4sId7f"                   # magic, ver, t(f64), ax..gz, checksum
+IMU_MAGIC = b"CIMU"
+
+
+def imu_write_sample(fd, t, a, g):
+    chk = a[0] + a[1] + a[2] + g[0] + g[1] + g[2]
+    os.pwrite(fd, struct.pack(IMU_FMT, IMU_MAGIC, 1, t, a[0], a[1], a[2],
+                              g[0], g[1], g[2], chk), 0)
+
+
+def imu_read_sample():
+    """Returns (t, (ax, ay, az), (gx, gy, gz)) or None."""
+    try:
+        with open(IMU_PATH, "rb") as f:
+            raw = f.read(struct.calcsize(IMU_FMT))
+        magic, _ver, t, ax, ay, az, gx, gy, gz, chk = struct.unpack(IMU_FMT, raw)
+        if magic != IMU_MAGIC or abs((ax + ay + az + gx + gy + gz) - chk) > 1e-3:
+            return None
+        return t, (ax, ay, az), (gx, gy, gz)
+    except Exception:
+        return None
+
+
+def imu_bridge(debug_secs=0, quiet=False):
+    """Bridge-side reader: IOKit HID -> IMU_PATH. Ctypes only, no dependencies."""
+    s = imu_read_sample()
+    if s and abs(time.monotonic() - s[0]) < 0.6 and not debug_secs:
+        if not quiet:
+            print("caf imu: a bridge is already streaming")
+        return 0
+    import ctypes
+    import ctypes.util
+    iokit = ctypes.cdll.LoadLibrary(ctypes.util.find_library("IOKit"))
+    cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+    C = ctypes
+
+    cf.CFStringCreateWithCString.restype = C.c_void_p
+    cf.CFStringCreateWithCString.argtypes = [C.c_void_p, C.c_char_p, C.c_uint32]
+    cf.CFNumberGetValue.argtypes = [C.c_void_p, C.c_long, C.c_void_p]
+    cf.CFRunLoopGetCurrent.restype = C.c_void_p
+    cf.CFRunLoopRunInMode.argtypes = [C.c_void_p, C.c_double, C.c_bool]
+    cf.CFRunLoopRunInMode.restype = C.c_int32
+    iokit.IOServiceMatching.restype = C.c_void_p
+    iokit.IOServiceMatching.argtypes = [C.c_char_p]
+    iokit.IOServiceGetMatchingServices.argtypes = [C.c_uint32, C.c_void_p,
+                                                   C.POINTER(C.c_uint32)]
+    iokit.IOIteratorNext.restype = C.c_uint32
+    iokit.IOIteratorNext.argtypes = [C.c_uint32]
+    iokit.IORegistryEntryCreateCFProperty.restype = C.c_void_p
+    iokit.IORegistryEntryCreateCFProperty.argtypes = [C.c_uint32, C.c_void_p,
+                                                      C.c_void_p, C.c_uint32]
+    iokit.IOHIDDeviceCreate.restype = C.c_void_p
+    iokit.IOHIDDeviceCreate.argtypes = [C.c_void_p, C.c_uint32]
+    iokit.IOHIDDeviceOpen.argtypes = [C.c_void_p, C.c_uint32]
+    iokit.IOHIDDeviceRegisterInputReportWithTimeStampCallback.argtypes = [
+        C.c_void_p, C.POINTER(C.c_ubyte), C.c_long, C.c_void_p, C.c_void_p]
+    iokit.IOHIDDeviceScheduleWithRunLoop.argtypes = [C.c_void_p, C.c_void_p,
+                                                     C.c_void_p]
+    iokit.IORegistryEntrySetCFProperty.argtypes = [C.c_uint32, C.c_void_p,
+                                                   C.c_void_p]
+    cf.CFNumberCreate.restype = C.c_void_p
+    cf.CFNumberCreate.argtypes = [C.c_void_p, C.c_long, C.c_void_p]
+
+    def cfstr(s):
+        return cf.CFStringCreateWithCString(None, s.encode(), 0x08000100)
+
+    def cfnum32(v):
+        return cf.CFNumberCreate(None, 3, C.byref(C.c_int32(v)))
+
+    def enable_streaming(svc):
+        """Wake the sensor: reporting on, power on, 1ms report interval."""
+        errs = 0
+        for k, v in (("SensorPropertyReportingState", 1),
+                     ("SensorPropertyPowerState", 1),
+                     ("ReportInterval", 1000)):
+            if iokit.IORegistryEntrySetCFProperty(svc, cfstr(k), cfnum32(v)) != 0:
+                errs += 1
+        return errs
+
+    def num_prop(svc, key):
+        ref = iokit.IORegistryEntryCreateCFProperty(svc, cfstr(key), None, 0)
+        if not ref:
+            return None
+        out = C.c_int32(0)
+        cf.CFNumberGetValue(ref, 3, C.byref(out))     # kCFNumberSInt32Type
+        return out.value
+
+    it = C.c_uint32(0)
+    matching = iokit.IOServiceMatching(b"AppleSPUHIDDevice")
+    if iokit.IOServiceGetMatchingServices(0, matching, C.byref(it)) != 0:
+        if not quiet:
+            print("caf imu: could not enumerate AppleSPUHIDDevice services")
+        return 1
+    targets = {}                       # kind -> io_service_t
+    while True:
+        svc = iokit.IOIteratorNext(it)
+        if not svc:
+            break
+        up, u = num_prop(svc, "PrimaryUsagePage"), num_prop(svc, "PrimaryUsage")
+        if (up, u) == (0xFF00, 3):
+            targets.setdefault("accel", svc)
+        elif (up, u) == (0xFF00, 9):
+            targets.setdefault("gyro", svc)
+    if "accel" not in targets:
+        if not quiet:
+            print("caf imu: no SPU accelerometer found (needs an M2+ MacBook)")
+        return 1
+    prop_errs = sum(enable_streaming(svc) for svc in targets.values())
+    # the enable knobs live on the AppleSPUHIDDriver services as well
+    it2 = C.c_uint32(0)
+    if iokit.IOServiceGetMatchingServices(
+            0, iokit.IOServiceMatching(b"AppleSPUHIDDriver"), C.byref(it2)) == 0:
+        while True:
+            svc = iokit.IOIteratorNext(it2)
+            if not svc:
+                break
+            up, u = num_prop(svc, "PrimaryUsagePage"), num_prop(svc, "PrimaryUsage")
+            if (up, u) in ((0xFF00, 3), (0xFF00, 9)):
+                prop_errs += enable_streaming(svc)
+    if prop_errs and os.geteuid() != 0 and debug_secs:
+        print(f"caf imu: {prop_errs} sensor-enable writes failed on the device "
+              "layer (driver layer usually suffices; try sudo if no samples flow)")
+
+    state = {"a": (0.0, 0.0, 0.0), "g": (0.0, 0.0, 0.0), "n": 0}
+    CB = C.CFUNCTYPE(None, C.c_void_p, C.c_int32, C.c_void_p, C.c_uint32,
+                     C.c_uint32, C.POINTER(C.c_ubyte), C.c_long, C.c_uint64)
+
+    def make_cb(kind):
+        def cb(_ctx, _res, _sender, _type, _rid, report, length, _ts):
+            if length < 18:
+                return
+            data = bytes(report[:int(length)])
+            x, y, z = struct.unpack_from("<iii", data, 6)
+            state[kind[0]] = (x / 65536.0, y / 65536.0, z / 65536.0)
+            state["n"] += 1
+        return CB(cb)
+
+    refs = []                          # keep callbacks + buffers alive
+    opened = 0
+    for kind, svc in targets.items():
+        dev = iokit.IOHIDDeviceCreate(None, svc)
+        if not dev:
+            continue
+        kr = iokit.IOHIDDeviceOpen(dev, 0)
+        if kr != 0:
+            if not quiet:
+                print(f"caf imu: open {kind} failed (0x{kr & 0xFFFFFFFF:08x})"
+                      + ("" if os.geteuid() == 0 else " — run with sudo"))
+            continue
+        buf = (C.c_ubyte * 64)()
+        cb = make_cb(kind)
+        refs.append((buf, cb))
+        iokit.IOHIDDeviceRegisterInputReportWithTimeStampCallback(dev, buf, 64, cb, None)
+        iokit.IOHIDDeviceScheduleWithRunLoop(dev, cf.CFRunLoopGetCurrent(),
+                                             C.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode"))
+        opened += 1
+    if not opened:
+        return 1
+
+    fd = os.open(IMU_PATH, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+    except OSError:
+        pass
+    if not quiet:
+        print(f"caf imu bridge: streaming {' + '.join(targets)} to {IMU_PATH}"
+              + (f" (debug {debug_secs}s)" if debug_secs else " — Ctrl+C to stop"))
+    t_end = time.monotonic() + debug_secs if debug_secs else None
+    last_dbg = 0.0
+    try:
+        while t_end is None or time.monotonic() < t_end:
+            cf.CFRunLoopRunInMode(
+                C.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode"), 0.03, False)
+            now = time.monotonic()
+            imu_write_sample(fd, now, state["a"], state["g"])
+            if debug_secs and now - last_dbg > 0.25:
+                last_dbg = now
+                a, g = state["a"], state["g"]
+                print(f"n={state['n']:6d}  a=({a[0]:+.3f},{a[1]:+.3f},{a[2]:+.3f})g"
+                      f"  gyro=({g[0]:+7.2f},{g[1]:+7.2f},{g[2]:+7.2f})dps")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        os.close(fd)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Shallow-water surface simulation
 # --------------------------------------------------------------------------
 
@@ -394,6 +592,7 @@ class Water:
     def __init__(self):
         self.h = [[0.0] * WGW for _ in range(WGH)]
         self.v = [[0.0] * WGW for _ in range(WGH)]
+        self.tilt = (0.0, 0.0)          # equilibrium slope (real-world gravity)
         self.mask = [[False] * WGW for _ in range(WGH)]
         for gy in range(WGH):
             for gx in range(WGW):
@@ -417,6 +616,10 @@ class Water:
                 above = up[gx] if mask[gy - 1][gx] and gy > 0 else c
                 below = dn[gx] if gy < WGH - 1 and mask[gy + 1][gx] else c
                 force = (left + right + above + below) / 4 - c
+                tx, ty = self.tilt
+                if tx or ty:
+                    force += ((gx / (WGW - 1) * 2 - 1) * tx
+                              + (gy / (WGH - 1) * 2 - 1) * ty - c) * 0.05
                 vrow[gx] = (vrow[gx] + force * 0.55) * 0.985
         for gy in range(WGH):
             hrow, vrow, mrow = h[gy], v[gy], mask[gy]
@@ -475,6 +678,8 @@ class Scene:
         self.auto_orbit = True
         self.z_push = 0.0               # 2.5D: >0 pushes steam toward the viewer
         self.updraft = 0.0
+        self._imu_grav = None
+        self._imu_down = None
         self.yaw_kick = 0.0             # 3d camera parallax from window motion
         self.pitch_kick = 0.0
 
@@ -500,6 +705,38 @@ class Scene:
 
     def gust(self, cols_delta):
         self.wind = max(-6.0, min(6.0, cols_delta * 0.4))
+
+    def imu_input(self, a, g, dt):
+        """Real laptop motion from the SPU IMU (a in g, gyro in deg/s)."""
+        if self._imu_grav is None:
+            self._imu_grav = list(a)
+        gr = self._imu_grav
+        k = min(1.0, dt * 2.0)          # low-pass -> gravity estimate
+        for i in range(3):
+            gr[i] += (a[i] - gr[i]) * k
+        lin = [a[i] - gr[i] for i in range(3)]
+        if self._imu_down is None:
+            mags = [abs(v) for v in gr]
+            self._imu_down = mags.index(max(mags))   # axis holding ~1g at rest
+        d = self._imu_down
+        h1, h2 = [i for i in range(3) if i != d]     # horizontal axes
+        # tilt: gravity leaking into the horizontal axes slants the coffee
+        tx = max(-0.5, min(0.5, gr[h1] * (1 if gr[d] > 0 else -1)))
+        ty = max(-0.5, min(0.5, gr[h2] * (1 if gr[d] > 0 else -1)))
+        self.water.tilt = (tx * 1.6, ty * 1.6)
+        self.wind += tx * 9 * dt                     # steam leans with tilt
+        # linear shoves: slosh + 2.5D depth push + updraft
+        mag = math.hypot(lin[h1], lin[h2])
+        if mag > 0.12:
+            self.water.disturb(max(-0.8, min(0.8, -lin[h1] * 4)),
+                               max(-0.8, min(0.8, -lin[h2] * 4)),
+                               min(0.5, mag * 1.6), 0.15)
+        self.z_push = max(-1.5, min(1.5, self.z_push + lin[h2] * 2.2))
+        self.updraft = max(-8.0, min(8.0, self.updraft - lin[d] * 10))
+        if self.mode3d:                              # gyro steers the camera
+            self.yaw_kick = max(-0.6, min(0.6, self.yaw_kick + g[d] * 0.0022))
+            self.pitch_kick = max(-0.25, min(0.25,
+                                             self.pitch_kick + g[h1] * 0.0009))
 
     def window_motion(self, vx, vy):
         """React to the terminal window being dragged (vx/vy in px/s).
@@ -1046,6 +1283,9 @@ def usage():
     print("\x1b[1mPresets:\x1b[0m " + ", ".join(THEMES) + "  (aliases: " + ", ".join(ALIASES) + ")")
     print("\x1b[1mKeys:\x1b[0m s = sip, space = stir, w = write the time, t = theme, q = quit; --3d adds arrows = orbit, o = auto-orbit")
     print("\x1b[1mThemes file:\x1b[0m ~/.config/caf/themes.toml")
+    print("\x1b[1mIMU:\x1b[0m auto-detected on M2+ MacBooks — real tilt slants the coffee,")
+    print("     shoves slosh it, spinning steers the 3D camera. caf-art --imu-debug [secs]")
+    print("     shows live samples; caf-art --imu-bridge runs the sensor bridge manually.")
 
 
 def main():
@@ -1081,6 +1321,15 @@ def main():
             weather = True
         elif a == "--3d":
             three_d = True
+        elif a == "--imu-bridge":
+            return imu_bridge(quiet="--quiet" in args)
+        elif a == "--quiet":
+            pass
+        elif a == "--imu-debug":
+            secs = 6
+            if i + 1 < len(args) and args[i + 1].isdigit():
+                secs = int(args[i + 1]); i += 1
+            return imu_bridge(debug_secs=secs)
         else:
             preset = ALIASES.get(a, a)
         i += 1
@@ -1091,6 +1340,19 @@ def main():
     if not no_caf and not demo_frames and shutil.which("caffeinate"):
         caf_proc = subprocess.Popen(["caffeinate", "-d"],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # auto-start the IMU bridge so real laptop motion just works (M2+; the
+    # bridge exits harmlessly on machines without the sensor)
+    imu_proc = None
+    if not demo_frames and sys.platform == "darwin":
+        s = imu_read_sample()
+        if not s or abs(time.monotonic() - s[0]) > 0.6:
+            try:
+                imu_proc = subprocess.Popen(
+                    [os.path.abspath(__file__), "--imu-bridge", "--quiet"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                imu_proc = None
 
     interactive = demo_frames == 0
     keyboard = interactive and sys.stdin.isatty()
@@ -1118,6 +1380,8 @@ def main():
     def cleanup():
         if caf_proc:
             caf_proc.terminate()
+        if imu_proc:
+            imu_proc.terminate()
         if old_termios is not None:
             import termios
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_termios)
@@ -1138,6 +1402,9 @@ def main():
     prev_sparkle_rows = set()
     last_word_stamp = None
     stdin_buf = ""
+    imu_at = 0.0
+    imu_prev_t = None
+    imu_active = False
     win_prev = None          # (t, x, y) last window position report
     win_query_at = 0.0
     WIN_RE = re.compile(r"\x1b\[3;(-?\d+);(-?\d+)t")
@@ -1215,6 +1482,19 @@ def main():
                     prev_lines = prev_status = None
                     continue
 
+            # real IMU samples, if a bridge is running
+            if interactive and now - imu_at > 0.06:
+                imu_at = now
+                s = imu_read_sample()
+                if s and abs(now - s[0]) < 0.6 and s[0] != imu_prev_t:
+                    scene.imu_input(s[1], s[2], now - (imu_prev_t or now - 0.07))
+                    imu_prev_t = s[0]
+                    imu_active = True
+                elif not s or abs(now - s[0]) >= 0.6:
+                    if imu_active:
+                        scene.water.tilt = (0.0, 0.0)
+                    imu_active = False
+
             # pomodoro drives the level
             extra = ""
             if pomo_end:
@@ -1242,6 +1522,9 @@ def main():
                 if lt.tm_min % 10 == 0 and lt.tm_sec < 2 and stamp != last_word_stamp:
                     last_word_stamp = stamp
                     scene.write_word(time.strftime("%H:%M"))
+
+            if imu_active:
+                extra += " · imu"
 
             # zen: slow theme crossfade + occasional auto-stir
             if zen:
