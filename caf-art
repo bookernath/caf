@@ -375,7 +375,9 @@ def render3d(scene):
                       min(255, int(base[1] * k + 200 * spec + 26 * fres)),
                       min(255, int(base[2] * k + 200 * spec + 30 * fres)))
     if half:
-        return [[px[j // 2][i // 2] for i in range(Wf)] for j in range(Hf)]
+        jm, im = Hpx - 1, W - 1
+        return [[px[min(j // 2, jm)][min(i // 2, im)] for i in range(Wf)]
+                for j in range(Hf)]
     return px
 
 
