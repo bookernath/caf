@@ -1064,18 +1064,30 @@ class Scene:
 
     # ---- cup rigid body: rocking, spilling, sliding, falling -------------
 
-    def _spawn_drops(self, n, side, splash=False):
+    def _spawn_drops(self, n, side, splash=False, frontal=0):
+        """Spill droplets. side = lateral rim (-1/+1); frontal = +1 pours
+        over the near rim (falls in front of the cup), -1 over the far rim
+        (falls behind it, occluded)."""
         hw0 = self.cup_w / 2
-        rx = self.cx + self.cup_dx + side * hw0 * random.uniform(0.7, 0.95)
-        ry = self.cup_top + self.cup_dy + self.rim_h * 0.5 + abs(self.cup_ang) * hw0 * 0.5
         sc = max(1, self.S)
         for _ in range(n):
+            if frontal:
+                rx = self.cx + self.cup_dx + random.uniform(-0.75, 0.75) * hw0
+                ry = (self.cup_top + self.cup_dy
+                      + (self.rim_h if frontal > 0 else 0) + self.cup_ang * hw0 * 0.4)
+                vx = (self.cup_vx + random.uniform(-3, 3)) * sc
+                layer = 0 if frontal > 0 else 1
+            else:
+                rx = self.cx + self.cup_dx + side * hw0 * random.uniform(0.7, 0.95)
+                ry = (self.cup_top + self.cup_dy + self.rim_h * 0.5
+                      + abs(self.cup_ang) * hw0 * 0.5)
+                vx = (side * random.uniform(4, 14) + self.cup_vx
+                      + (random.uniform(-22, 22) if splash else 0)) * sc
+                layer = 0
             self.drops.append([rx + random.uniform(-1.5, 1.5) * sc,
-                               ry + random.uniform(-1.0, 1.0) * sc,
-                               (side * random.uniform(4, 14) + self.cup_vx
-                                + (random.uniform(-22, 22) if splash else 0)) * sc,
+                               ry + random.uniform(-1.0, 1.0) * sc, vx,
                                (random.uniform(-14, 2) if splash
-                                else random.uniform(-3, 3)) * sc])
+                                else random.uniform(-3, 3)) * sc, layer])
 
     def _dump_liquid(self):
         """Everything still in the cup hits the floor."""
@@ -1137,16 +1149,24 @@ class Scene:
                 if st == "seated":
                     self.spills += 1
                 self.cup_av += math.copysign(1.4, self.cup_ang)
-            # liquid over the rim: level + slosh + lean decide the overflow
+            # liquid over the rim: level + slosh + lean decide the overflow,
+            # on any of the four rims (left/right and near/far)
             eff = drive + self.cup_ang * 2.0
-            head = self.level * 0.45 + abs(eff) * 0.38 + abs(self.cup_ang) * 0.30
+            ty = self.tilt_in[1]
+            head_x = self.level * 0.45 + abs(eff) * 0.38 + abs(self.cup_ang) * 0.30
+            head_y = self.level * 0.45 + abs(ty) * 0.56
+            head = max(head_x, head_y)
             if head > 0.75 and self.level > 0.06:
                 exc = min(0.5, head - 0.75)
                 self.level = max(0.02, self.level - exc * 2.6 * dt)
                 self.target_level = min(self.target_level, self.level)
                 if random.random() < exc * 22 * dt + 0.1:
-                    self._spawn_drops(random.randint(1, 3),
-                                      math.copysign(1.0, eff))
+                    if head_x >= head_y:
+                        self._spawn_drops(random.randint(1, 3),
+                                          math.copysign(1.0, eff))
+                    else:
+                        self._spawn_drops(random.randint(1, 3), 0,
+                                          frontal=1 if ty > 0 else -1)
                 if self.snd and random.random() < dt * 1.5:
                     self.snd("drip", 0.4)
                 if self.reset_at is None and self.level < 0.5:
@@ -1552,11 +1572,24 @@ class Scene:
                 col = mix(col, (255, 255, 255), 0.10 * gl)
                 row[x - bx0] = col
 
+        # droplets pouring over the far rim fall behind the cup
+        sc_ = max(1, self.S)
+        if self.drops:
+            bdc = shade(mix(th["liquid"], th["crema"], 0.3), 0.7)
+            for d in self.drops:
+                if d[4] != 1:
+                    continue
+                xi, yi = int(d[0]), int(d[1])
+                for dy2 in range(sc_):
+                    for dx2 in range(max(1, sc_ // 2)):
+                        X, Y = xi + dx2, yi + dy2
+                        if 0 <= X < W and 0 <= Y < H:
+                            px[Y][X] = bdc
+
         self._composite_cup(px, cb, bx0, by0, bw, bh)
 
         # floor puddle: spilled coffee pooling against the terminal walls
         p = self.puddle
-        sc_ = max(1, self.S)
         if any(v > 0.05 for v in p):
             liq = th["liquid"]
             cap = 4.0 * sc_
@@ -1571,10 +1604,12 @@ class Scene:
                 if 0 <= ty_ < H:
                     px[ty_][x] = mix(shade(liq, 0.85), th["crema"], 0.2)
 
-        # flying droplets
+        # flying droplets (near-rim spills run down the front of the cup)
         if self.drops:
             dc = mix(th["liquid"], th["crema"], 0.3)
             for d in self.drops:
+                if d[4] != 0:
+                    continue
                 xi, yi = int(d[0]), int(d[1])
                 for dy2 in range(sc_):
                     for dx2 in range(max(1, sc_ // 2)):
