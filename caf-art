@@ -202,6 +202,178 @@ FONT = {
 
 
 # --------------------------------------------------------------------------
+# Ray-marched 3D cup (--3d): SDF scene, sphere-traced in pure Python
+# --------------------------------------------------------------------------
+# Cup wall and saucer are revolved polyline profiles (r, y) with a tube
+# thickness; the handle is a squashed torus; the liquid is a capped disc
+# whose normal is bump-mapped from the shallow-water simulation.
+
+WALL3D = [(0.00, 0.06), (0.52, 0.06), (0.68, 0.10), (0.76, 0.20), (0.80, 1.00)]
+SAUCER3D = [(0.00, -0.10), (1.02, -0.09), (1.22, -0.01)]
+WALL_SEGS3D = [(a[0], a[1], b[0] - a[0], b[1] - a[1],
+                (b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
+               for a, b in zip(WALL3D, WALL3D[1:])]
+SAUCER_SEGS3D = [(a[0], a[1], b[0] - a[0], b[1] - a[1],
+                  (b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
+                 for a, b in zip(SAUCER3D, SAUCER3D[1:])]
+LIQ_R3D = 0.72
+
+
+def sdf3d(x, y, z, liq_y):
+    """Signed distance to the scene. Returns (distance, material 0/1/2)."""
+    q = math.sqrt(x * x + z * z)
+    best = 1e9
+    for ax, ay, dx, dy, dd in WALL_SEGS3D:
+        px, py = q - ax, y - ay
+        h = (px * dx + py * dy) / dd
+        h = 0.0 if h < 0.0 else (1.0 if h > 1.0 else h)
+        ex, ey = px - dx * h, py - dy * h
+        d = ex * ex + ey * ey
+        if d < best:
+            best = d
+    d_cup = math.sqrt(best) - 0.05
+    hx, hy = x - 0.92, (y - 0.55) * 1.15            # handle torus
+    qq = math.sqrt(hx * hx + hy * hy) - 0.30
+    d_han = math.sqrt(qq * qq + z * z) - 0.055
+    if d_han < d_cup:
+        d_cup = d_han
+    best = 1e9
+    for ax, ay, dx, dy, dd in SAUCER_SEGS3D:
+        px, py = q - ax, y - ay
+        h = (px * dx + py * dy) / dd
+        h = 0.0 if h < 0.0 else (1.0 if h > 1.0 else h)
+        ex, ey = px - dx * h, py - dy * h
+        d = ex * ex + ey * ey
+        if d < best:
+            best = d
+    d_sau = math.sqrt(best) - 0.045
+    d_liq = y - liq_y                                # liquid: capped disc
+    if q - LIQ_R3D > d_liq:
+        d_liq = q - LIQ_R3D
+    if 0.12 - y > d_liq:
+        d_liq = 0.12 - y
+    if d_liq < d_cup and d_liq < d_sau:
+        return d_liq, 2
+    if d_sau < d_cup:
+        return d_sau, 1
+    return d_cup, 0
+
+
+def cam3d(yaw, pitch):
+    """Camera eye + orthonormal basis for the orbit camera."""
+    tx, ty, tz = 0.0, 0.55, 0.0
+    dist = 3.4
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    ex, ey, ez = tx + dist * cp * math.sin(yaw), ty + dist * sp, tz + dist * cp * math.cos(yaw)
+    fx, fy, fz = tx - ex, ty - ey, tz - ez
+    fl = math.sqrt(fx * fx + fy * fy + fz * fz)
+    fx, fy, fz = fx / fl, fy / fl, fz / fl
+    rx, rz = -fz, fx
+    rl = math.sqrt(rx * rx + rz * rz)
+    rx, rz = rx / rl, rz / rl
+    ux, uy, uz = -rz * fy, rz * fx - rx * fz, rx * fy
+    return ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz
+
+
+def project3d(scene, wx, wy, wz):
+    """World point -> (col, half-block row) under the current orbit camera."""
+    W, Hpx = scene.W, scene.H
+    ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz = cam3d(scene.yaw, scene.pitch)
+    wx, wy, wz = wx - ex, wy - ey, wz - ez
+    zc = wx * fx + wy * fy + wz * fz
+    uc = (wx * rx + wz * rz) / zc * 1.9
+    vc = (wx * ux + wy * uy + wz * uz) / zc * 1.9
+    aspect = W / Hpx
+    return ((uc / (aspect * 0.95) + 1) / 2 * W,
+            (1 - (vc + 0.28) / 0.95) / 2 * Hpx)
+
+
+def render3d(scene):
+    """Sphere-trace the scene into a px buffer (None = background)."""
+    Wf, Hf = scene.W, scene.H
+    half = (Wf * Hf > 9000 and not scene.S) or Wf * Hf > 26000
+    W, Hpx = (Wf // 2, Hf // 2) if half else (Wf, Hf)
+    th = scene.theme
+    cup_col, liq_col, crema, sauc_col = th["cup"], th["liquid"], th["crema"], th["saucer"]
+    liq_y = 0.30 + 0.62 * scene.level
+    ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz = cam3d(scene.yaw, scene.pitch)
+    lx, ly, lz = -0.4082, 0.7715, -0.4876            # normalized key light
+    ws = scene.water.sample
+    aspect = W / Hpx
+    px = [[None] * W for _ in range(Hpx)]
+    ocy = ey - 0.45
+    c_sph = ex * ex + ocy * ocy + ez * ez - 2.6244   # bounding sphere r=1.62
+    sdf = sdf3d
+    for j in range(Hpx):
+        v = (1 - (j + 0.5) / Hpx * 2) * 0.95 - 0.28
+        row = px[j]
+        dyv = fy * 1.9 + uy * v
+        for i in range(W):
+            u = ((i + 0.5) / W * 2 - 1) * aspect * 0.95
+            dx = fx * 1.9 + rx * u + ux * v
+            dy = dyv
+            dz = fz * 1.9 + rz * u + uz * v
+            dl = math.sqrt(dx * dx + dy * dy + dz * dz)
+            dx, dy, dz = dx / dl, dy / dl, dz / dl
+            b = ex * dx + ocy * dy + ez * dz
+            disc = b * b - c_sph
+            if disc < 0:
+                continue
+            sq = math.sqrt(disc)
+            t1 = -b + sq
+            if t1 < 0:
+                continue
+            t = max(-b - sq, 0.0)
+            mat = -1
+            for _ in range(48):
+                pxx, pyy, pzz = ex + dx * t, ey + dy * t, ez + dz * t
+                d, m = sdf(pxx, pyy, pzz, liq_y)
+                if d < 0.0035 + 0.0015 * t:
+                    mat = m
+                    break
+                t += d * 0.92
+                if t > t1:
+                    break
+            if mat < 0:
+                continue
+            e = 0.004
+            nx = sdf(pxx + e, pyy, pzz, liq_y)[0] - sdf(pxx - e, pyy, pzz, liq_y)[0]
+            ny = sdf(pxx, pyy + e, pzz, liq_y)[0] - sdf(pxx, pyy - e, pzz, liq_y)[0]
+            nz = sdf(pxx, pyy, pzz + e, liq_y)[0] - sdf(pxx, pyy, pzz - e, liq_y)[0]
+            nl = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+            nx, ny, nz = nx / nl, ny / nl, nz / nl
+            if mat == 2:                              # bump-map from the water sim
+                lu, lv = pxx / LIQ_R3D, pzz / LIQ_R3D
+                gx = (ws(lu + 0.09, lv) - ws(lu - 0.09, lv)) * 1.4
+                gz = (ws(lu, lv + 0.09) - ws(lu, lv - 0.09)) * 1.4
+                nx -= gx
+                nz -= gz
+                nl = math.sqrt(nx * nx + ny * ny + nz * nz)
+                nx, ny, nz = nx / nl, ny / nl, nz / nl
+            diff = nx * lx + ny * ly + nz * lz
+            if diff < 0:
+                diff = 0.0
+            hx_, hy_, hz_ = lx - dx, ly - dy, lz - dz
+            hl = math.sqrt(hx_ * hx_ + hy_ * hy_ + hz_ * hz_) or 1.0
+            spec = (nx * hx_ + ny * hy_ + nz * hz_) / hl
+            spec = spec ** 40 if spec > 0 else 0.0
+            fres = (1.0 - max(0.0, -(nx * dx + ny * dy + nz * dz))) ** 2
+            if mat == 2:
+                base = tuple(int(a + (b - a) * min(1.0, 0.18 + diff * 0.45 + spec * 0.6))
+                             for a, b in zip(liq_col, crema))
+                k = 0.38 + 0.7 * diff
+            else:
+                base = cup_col if mat == 0 else sauc_col
+                k = 0.24 + 0.78 * diff
+            row[i] = (min(255, int(base[0] * k + 200 * spec + 26 * fres)),
+                      min(255, int(base[1] * k + 200 * spec + 26 * fres)),
+                      min(255, int(base[2] * k + 200 * spec + 30 * fres)))
+    if half:
+        return [[px[j // 2][i // 2] for i in range(Wf)] for j in range(Hf)]
+    return px
+
+
+# --------------------------------------------------------------------------
 # Shallow-water surface simulation
 # --------------------------------------------------------------------------
 
@@ -289,6 +461,10 @@ class Scene:
         self.weather = None
         self.water = Water()
         self.word = None                # dict(pairs=[(particle, tx, ty)], until=t)
+        self.mode3d = False
+        self.yaw = 0.6
+        self.pitch = 0.38
+        self.auto_orbit = True
 
     # ---- events ----------------------------------------------------------
 
@@ -365,6 +541,20 @@ class Scene:
         self.cup_top = self.cup_bot - cup_h
         self.rim_h = max(3, cup_h // 5)
         self.steam_by = max(2, (self.cup_top + self.rim_h) * 2)
+        if self.mode3d:
+            self._anchor3d()
+
+    def _anchor3d(self):
+        """Derive the 2D steam/word anchors from the projected 3D rim."""
+        ci, cj = project3d(self, 0.0, 1.0, 0.0)
+        _, _, _, _, _, _, rx, rz, _, _, _ = cam3d(self.yaw, self.pitch)
+        ri, _ = project3d(self, 0.8 * rx, 1.0, 0.8 * rz)
+        half_w = max(4.0, abs(ri - ci))
+        self.cx = int(ci)
+        self.cup_w = int(half_w * 2)
+        self.cup_top = max(2, int(cj))
+        self.rim_h = max(2, int(half_w * math.sin(self.pitch)))
+        self.steam_by = max(2, (self.cup_top + self.rim_h) * 2)
 
     # ---- simulation ------------------------------------------------------
 
@@ -376,6 +566,10 @@ class Scene:
 
     def step(self, dt):
         t = self.t
+        if self.mode3d:
+            if self.auto_orbit:
+                self.yaw += dt * 0.10
+            self._anchor3d()
         if t - self._heat_at > 1.0:
             self._heat_at = t
             self._sample_heat()
@@ -467,6 +661,14 @@ class Scene:
     # ---- drawing ---------------------------------------------------------
 
     def draw(self):
+        if self.mode3d:
+            px = render3d(self)
+            sgrid = [[0.0] * (self.W * 2) for _ in range(self.steam_by)] if not self.S else None
+            if self.S:
+                self._splat_hires(px)
+            else:
+                self._splat_braille(px, sgrid)
+            return px, sgrid
         W, H = self.W, self.H
         px = [[None] * W for _ in range(H)]
         th = self.theme
@@ -716,7 +918,12 @@ class Scene:
         cup_bar = "▇" * n + "░" * (4 - n)
         hn = min(3, int(self.heat * 3 + 0.5))
         heat_bar = "▂▄▆"[:hn] or "·"
-        keys = " · [s]ip [␣]stir [w]rite [t]heme [q]uit" if interactive else " · Ctrl+C to stop"
+        if not interactive:
+            keys = " · Ctrl+C to stop"
+        elif self.mode3d:
+            keys = " · [s]ip [␣]stir [←→↑↓/o]rbit [w]rite [t]heme [q]uit"
+        else:
+            keys = " · [s]ip [␣]stir [w]rite [t]heme [q]uit"
         text = f" {th['icon']}  {th['name']} · awake {clock} · cup {cup_bar} · heat {heat_bar}{extra}{keys} "
         if len(text) > width:
             text = f" {th['icon']} {clock} {cup_bar}{extra} "
@@ -790,9 +997,9 @@ def fetch_weather(scene):
 # --------------------------------------------------------------------------
 
 def usage():
-    print("\x1b[1mUsage:\x1b[0m caf [preset] [--pomodoro N] [--weather] [--zen] [--hires]")
+    print("\x1b[1mUsage:\x1b[0m caf [preset] [--3d] [--pomodoro N] [--weather] [--zen] [--hires]")
     print("\x1b[1mPresets:\x1b[0m " + ", ".join(THEMES) + "  (aliases: " + ", ".join(ALIASES) + ")")
-    print("\x1b[1mKeys:\x1b[0m s = sip, space = stir, w = write the time, t = theme, q = quit")
+    print("\x1b[1mKeys:\x1b[0m s = sip, space = stir, w = write the time, t = theme, q = quit; --3d adds arrows = orbit, o = auto-orbit")
     print("\x1b[1mThemes file:\x1b[0m ~/.config/caf/themes.toml")
 
 
@@ -807,6 +1014,7 @@ def main():
     zen = False
     hires = False
     weather = False
+    three_d = False
     i = 0
     while i < len(args):
         a = args[i]
@@ -826,6 +1034,8 @@ def main():
             hires = True
         elif a == "--weather":
             weather = True
+        elif a == "--3d":
+            three_d = True
         else:
             preset = ALIASES.get(a, a)
         i += 1
@@ -839,8 +1049,9 @@ def main():
 
     interactive = demo_frames == 0
     keyboard = interactive and sys.stdin.isatty()
-    S = 4 if hires else 0
+    S = (2 if three_d else 4) if hires else 0
     scene = Scene(preset, hires_scale=S)
+    scene.mode3d = three_d
     scene._sample_heat()
     if weather:
         fetch_weather(scene)
@@ -901,7 +1112,14 @@ def main():
                                    if p[1] < scene.cup_top + scene.rim_h]
 
             if keyboard and select.select([sys.stdin], [], [], 0)[0]:
-                for ch in os.read(sys.stdin.fileno(), 64).decode(errors="ignore"):
+                data = os.read(sys.stdin.fileno(), 64).decode(errors="ignore")
+                if three_d:
+                    scene.yaw += 0.18 * (data.count("\x1b[D") - data.count("\x1b[C"))
+                    scene.pitch = max(0.12, min(0.95, scene.pitch
+                                                + 0.08 * (data.count("\x1b[A") - data.count("\x1b[B"))))
+                    if "o" in data:
+                        scene.auto_orbit = not scene.auto_orbit
+                for ch in data:
                     if ch == "s":
                         scene.sip(pomo=bool(pomo_end))
                     elif ch == " ":
@@ -971,7 +1189,7 @@ def main():
                 if random.random() < 0.0005:
                     scene.stir()
 
-            dt = 0.1 if S else 0.066
+            dt = (0.15 if three_d else 0.1) if S else 0.066
             scene.t += dt
             scene.step(dt)
             px, sgrid = scene.draw()

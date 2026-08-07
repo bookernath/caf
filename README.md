@@ -34,6 +34,16 @@ cup of coffee. Zero dependencies — one Python file, Python 3.11+.
 
 ![hires](screenshots/hires.png)
 
+- **Ray-marched 3D mode** (`--3d`) — the cup becomes a signed-distance-field
+  scene (revolved-profile cup and saucer, torus handle, liquid disc)
+  sphere-traced in pure Python with Blinn-Phong shading, fresnel rim light,
+  and a slow orbit camera. The liquid surface is bump-mapped live from the
+  same shallow-water simulation, so stirring and sipping ripple in 3D.
+  Arrow keys orbit, `o` toggles auto-orbit. ~25 ms/frame at 90×30 —
+  no numpy, no GPU, just sphere tracing in a `for` loop.
+
+![3d](screenshots/cup3d_cyber.png)
+
 ## Usage
 
 ```sh
