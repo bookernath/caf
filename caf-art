@@ -373,6 +373,7 @@ def render3d(scene):
                 nl = math.sqrt(nx * nx + ny * ny + nz * nz)
                 nx, ny, nz = nx / nl, ny / nl, nz / nl
             diff = nx * lx + ny * ly + nz * lz
+            spec_sh = 1.0
             if diff < 0:
                 diff = 0.0
             elif diff > 0.02:                 # one soft shadow ray per hit
@@ -393,8 +394,6 @@ def render3d(scene):
                 sh = max(0.0, sh)
                 diff *= 0.22 + 0.78 * sh
                 spec_sh = 0.25 + 0.75 * sh
-            else:
-                spec_sh = 1.0
             hx_, hy_, hz_ = lx - dx, ly - dy, lz - dz
             hl = math.sqrt(hx_ * hx_ + hy_ * hy_ + hz_ * hz_) or 1.0
             spec = (nx * hx_ + ny * hy_ + nz * hz_) / hl
