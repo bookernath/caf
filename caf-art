@@ -41,6 +41,7 @@ import base64
 import math
 import os
 import random
+import re
 import select
 import shutil
 import signal
@@ -275,10 +276,15 @@ def cam3d(yaw, pitch):
     return ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz
 
 
+def cam_angles(scene):
+    return (scene.yaw + scene.yaw_kick,
+            max(0.10, min(0.98, scene.pitch + scene.pitch_kick)))
+
+
 def project3d(scene, wx, wy, wz):
     """World point -> (col, half-block row) under the current orbit camera."""
     W, Hpx = scene.W, scene.H
-    ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz = cam3d(scene.yaw, scene.pitch)
+    ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz = cam3d(*cam_angles(scene))
     wx, wy, wz = wx - ex, wy - ey, wz - ez
     zc = wx * fx + wy * fy + wz * fz
     uc = (wx * rx + wz * rz) / zc * 1.9
@@ -296,7 +302,7 @@ def render3d(scene):
     th = scene.theme
     cup_col, liq_col, crema, sauc_col = th["cup"], th["liquid"], th["crema"], th["saucer"]
     liq_y = 0.30 + 0.62 * scene.level
-    ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz = cam3d(scene.yaw, scene.pitch)
+    ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz = cam3d(*cam_angles(scene))
     lx, ly, lz = -0.4082, 0.7715, -0.4876            # normalized key light
     ws = scene.water.sample
     aspect = W / Hpx
@@ -465,6 +471,10 @@ class Scene:
         self.yaw = 0.6
         self.pitch = 0.38
         self.auto_orbit = True
+        self.z_push = 0.0               # 2.5D: >0 pushes steam toward the viewer
+        self.updraft = 0.0
+        self.yaw_kick = 0.0             # 3d camera parallax from window motion
+        self.pitch_kick = 0.0
 
     # ---- events ----------------------------------------------------------
 
@@ -488,6 +498,28 @@ class Scene:
 
     def gust(self, cols_delta):
         self.wind = max(-6.0, min(6.0, cols_delta * 0.4))
+
+    def window_motion(self, vx, vy):
+        """React to the terminal window being dragged (vx/vy in px/s).
+
+        Horizontal drags blow the steam sideways; vertical drags read as
+        toward/away motion: an updraft plus a 2.5D depth push that swells or
+        shrinks the wisps. Hard shoves slosh the coffee by inertia and, in 3D,
+        nudge the camera for parallax.
+        """
+        self.wind = max(-8.0, min(8.0, self.wind - vx * 0.006))
+        self.updraft = max(-8.0, min(8.0, self.updraft + vy * 0.005))
+        self.z_push = max(-1.5, min(1.5, self.z_push + vy * 0.0012))
+        speed = math.hypot(vx, vy)
+        if speed > 700:                              # inertial slosh
+            su = -0.65 if vx > 0 else 0.65
+            if abs(vy) > abs(vx):
+                su = random.uniform(-0.3, 0.3)
+            self.water.disturb(su, random.uniform(-0.4, 0.4),
+                               min(0.5, speed / 4000), 0.16)
+        if self.mode3d:
+            self.yaw_kick = max(-0.3, min(0.3, self.yaw_kick - vx * 0.00012))
+            self.pitch_kick = max(-0.2, min(0.2, self.pitch_kick + vy * 0.00010))
 
     def write_word(self, text):
         """Steam particles converge to spell `text` above the cup, then dissolve."""
@@ -517,7 +549,7 @@ class Scene:
             else:
                 p = [self.cx + random.gauss(0, self.cup_w * 0.2),
                      float(self.cup_top + self.rim_h // 2),
-                     random.uniform(0, math.tau), 0.0, self.cup_top * 1.0]
+                     random.uniform(0, math.tau), 0.0, self.cup_top * 1.0, 0.0]
                 self.particles.append(p)
             pairs.append((p, bx / 2, by / 2))
         self.word = dict(pairs=pairs, until=self.t + 3.2)
@@ -547,7 +579,7 @@ class Scene:
     def _anchor3d(self):
         """Derive the 2D steam/word anchors from the projected 3D rim."""
         ci, cj = project3d(self, 0.0, 1.0, 0.0)
-        _, _, _, _, _, _, rx, rz, _, _, _ = cam3d(self.yaw, self.pitch)
+        _, _, _, _, _, _, rx, rz, _, _, _ = cam3d(*cam_angles(self))
         ri, _ = project3d(self, 0.8 * rx, 1.0, 0.8 * rz)
         half_w = max(4.0, abs(ri - ci))
         self.cx = int(ci)
@@ -576,6 +608,11 @@ class Scene:
         pouring = self.target_level - self.level > 0.04
         self.level += (self.target_level - self.level) * min(1.0, dt * (1.2 if pouring else 2.5))
         self.wind *= math.exp(-dt * 1.2)
+        decay = math.exp(-dt * 1.6)
+        self.updraft *= decay
+        self.z_push *= decay
+        self.yaw_kick *= decay
+        self.pitch_kick *= decay
 
         # --- water surface ---
         w = self.water
@@ -602,7 +639,7 @@ class Scene:
                 self.particles.append([plume + random.gauss(0, 1.2),
                                        float(self.cup_top + self.rim_h // 2),
                                        random.uniform(0, math.tau), 0.0,
-                                       random.uniform(0.7, 1.05) * self.cup_top])
+                                       random.uniform(0.7, 1.05) * self.cup_top, 0.0])
 
         word_set = set()
         if self.word:
@@ -628,7 +665,8 @@ class Scene:
             nx, ny = curl(p[0] * 0.08 / max(1, self.S), p[1] * 0.08 / max(1, self.S), )
             sc = max(1, self.S)
             p[0] += (nx * s * sc + math.sin(t * 0.5) * 1.2 * sc + self.wind * 6 * sc * 0.1) * dt * 2.2
-            p[1] -= (13 + 7 * math.sin(p[2]) - ny * s * 0.6) * dt * 1.35 * sc * speed
+            p[1] -= (13 + 7 * math.sin(p[2]) - ny * s * 0.6 + self.updraft * 5) * dt * 1.35 * sc * speed
+            p[5] += (self.z_push - p[5]) * min(1.0, dt * 2.5)
             p[3] += dt * 22
             if p[3] < p[4] and p[1] > 1:
                 alive.append(p)
@@ -789,9 +827,12 @@ class Scene:
         W, H = self.W, self.H
         sc = self.theme["steam"]
         bw = W * 2
-        for x, y, ph, age, life in self.particles:
+        for p in self.particles:
+            x, y, age, life, pz = p[0], p[1], p[3], p[4], p[5]
+            zk = 1.0 + pz * 0.55
             a = max(0.0, 1 - age / life) ** 1.3 * 0.95
-            spread = 1 + int((1 - a) * 2)
+            a = min(1.0, a * (1.0 + pz * 0.35))
+            spread = max(1, int((1 + (1 - a) * 2) * zk))
             bx, by = int(x * 2), int(y * 2)
             for dx, dy, w in ((0, 0, 1.0), (-1, 0, 0.55), (1, 0, 0.55),
                               (0, -1, 0.5), (0, 1, 0.35),
@@ -814,9 +855,11 @@ class Scene:
         W, H = self.W, self.H
         S = self.S
         sc = self.theme["steam"]
-        for x, y, ph, age, life in self.particles:
+        for p in self.particles:
+            x, y, age, life, pz = p[0], p[1], p[3], p[4], p[5]
             a = max(0.0, 1 - age / life) ** 1.3 * 0.95
-            R = max(1, int(S * 0.5 + (1 - a) * S * 0.9))
+            a = min(1.0, a * (1.0 + pz * 0.35))
+            R = max(1, int((S * 0.5 + (1 - a) * S * 0.9) * (1.0 + pz * 0.55)))
             xi0, yi0 = int(x), int(y)
             for dy in range(-R, R + 1):
                 yi = yi0 + dy
@@ -1092,6 +1135,11 @@ def main():
     prev_status = None
     prev_sparkle_rows = set()
     last_word_stamp = None
+    stdin_buf = ""
+    win_prev = None          # (t, x, y) last window position report
+    win_query_at = 0.0
+    WIN_RE = re.compile(r"\x1b\[3;(-?\d+);(-?\d+)t")
+    CSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z~]")
     try:
         while True:
             now = time.monotonic()
@@ -1111,15 +1159,38 @@ def main():
                 scene.particles = [p for p in scene.particles
                                    if p[1] < scene.cup_top + scene.rim_h]
 
-            if keyboard and select.select([sys.stdin], [], [], 0)[0]:
-                data = os.read(sys.stdin.fileno(), 64).decode(errors="ignore")
+            if keyboard:
+                if now - win_query_at > 0.15:        # poll window position
+                    win_query_at = now
+                    sys.stdout.write("\x1b[13t")
+                    sys.stdout.flush()
+                while select.select([sys.stdin], [], [], 0)[0]:
+                    chunk = os.read(sys.stdin.fileno(), 256).decode(errors="ignore")
+                    if not chunk:
+                        break
+                    stdin_buf += chunk
+                reports = WIN_RE.findall(stdin_buf)
+                if reports:
+                    wx, wy = int(reports[-1][0]), int(reports[-1][1])
+                    if win_prev is not None:
+                        dtw = now - win_prev[0]
+                        if 0 < dtw < 1.0:
+                            vx = (wx - win_prev[1]) / dtw
+                            vy = (wy - win_prev[2]) / dtw
+                            if abs(vx) + abs(vy) > 40:
+                                scene.window_motion(vx, vy)
+                    win_prev = (now, wx, wy)
+                    stdin_buf = WIN_RE.sub("", stdin_buf)
                 if three_d:
-                    scene.yaw += 0.18 * (data.count("\x1b[D") - data.count("\x1b[C"))
+                    scene.yaw += 0.18 * (stdin_buf.count("\x1b[D") - stdin_buf.count("\x1b[C"))
                     scene.pitch = max(0.12, min(0.95, scene.pitch
-                                                + 0.08 * (data.count("\x1b[A") - data.count("\x1b[B"))))
-                    if "o" in data:
+                                                + 0.08 * (stdin_buf.count("\x1b[A") - stdin_buf.count("\x1b[B"))))
+                    if "o" in CSI_RE.sub("", stdin_buf):
                         scene.auto_orbit = not scene.auto_orbit
-                for ch in data:
+                plain = CSI_RE.sub("", stdin_buf)
+                tail = re.search(r"\x1b(\[[0-9;?]*)?$", stdin_buf)
+                stdin_buf = tail.group(0) if tail else ""
+                for ch in plain:
                     if ch == "s":
                         scene.sip(pomo=bool(pomo_end))
                     elif ch == " ":

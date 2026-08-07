@@ -28,6 +28,13 @@ cup of coffee. Zero dependencies — one Python file, Python 3.11+.
 
 - **Responsive** — layout recomputes from the terminal size every frame;
   resizing rescales the whole scene (and gusts the steam sideways).
+- **Window motion is physics** — the terminal's position is polled via the
+  xterm `CSI 13 t` report; dragging the window blows the steam around,
+  shoving it fast sloshes the coffee by inertia, and vertical jerks push the
+  steam toward or away from you in 2.5D (wisps swell and brighten as they
+  approach). In 3D mode the camera picks up a parallax nudge too.
+  (Macs no longer ship an accelerometer, so window motion is the honest
+  stand-in for waving your laptop around.)
 - **Diff rendering** — only changed lines are re-emitted each frame.
 - **Kitty graphics mode** (`--hires`) — on Ghostty/kitty, renders the same
   scene as real images at 4 px per cell.
