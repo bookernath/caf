@@ -33,8 +33,27 @@ cup of coffee. Zero dependencies — one Python file, Python 3.11+.
   shoving it fast sloshes the coffee by inertia, and vertical jerks push the
   steam toward or away from you in 2.5D (wisps swell and brighten as they
   approach). In 3D mode the camera picks up a parallax nudge too.
-  (Macs no longer ship an accelerometer, so window motion is the honest
-  stand-in for waving your laptop around.)
+- **Real laptop motion is physics** — Apple Silicon MacBooks (M2+) hide a
+  real MEMS IMU in the Sensor Processing Unit. A tiny ctypes bridge streams
+  it (no sudo, no dependencies): tilting the laptop slants the coffee,
+  shoves slosh it, and spinning it steers the 3D camera.
+- **Spill physics** — the cup is a rigid body. Tilt far enough and the
+  coffee runs over the rim, streaks down, stains the saucer, and pools on
+  the floor against the terminal walls. Keep going (or knock it with `x`, a
+  hard window-shove, or a real-world jolt) and it slides off the saucer,
+  tumbles, bounces off the window edges, and dumps everything —
+  the steam spells OOPS, and housekeeping restores order a few
+  seconds later.
+
+![spill](screenshots/spill90.png)
+
+- **Ambient light sensor** — the same SPU exposes the ALS. Dim the room and
+  the scene dims to embers (the steam catches what light remains); a bright
+  morning brings it back.
+- **Sound** (`--sound`) — procedurally synthesized foley (no assets:
+  the WAVs are generated on first run): a ceramic clink for stirs, a glug
+  for pours, a slurp for sips, a bell for the pomodoro, and a crash when
+  the cup meets the floor.
 - **Diff rendering** — only changed lines are re-emitted each frame.
 - **Kitty graphics mode** (`--hires`) — on Ghostty/kitty, renders the same
   scene as real images at 4 px per cell.
@@ -43,13 +62,17 @@ cup of coffee. Zero dependencies — one Python file, Python 3.11+.
 
 - **Ray-marched 3D mode** (`--3d`) — the cup becomes a signed-distance-field
   scene (revolved-profile cup and saucer, torus handle, liquid disc)
-  sphere-traced in pure Python with Blinn-Phong shading, fresnel rim light,
-  and a slow orbit camera. The liquid surface is bump-mapped live from the
-  same shallow-water simulation, so stirring and sipping ripple in 3D.
-  Arrow keys orbit, `o` toggles auto-orbit. ~25 ms/frame at 90×30 —
+  sphere-traced in pure Python: Blinn-Phong shading, fresnel rim light, one
+  soft penumbra shadow ray per hit (the cup casts a real contact shadow on
+  the saucer), and a single reflection bounce on the liquid that mirrors the
+  inner wall. The steam is volumetric — world-space wisps rise off the
+  liquid surface, orbit with the camera, catch the key light, and disappear
+  behind the cup via a depth buffer. The liquid surface is bump-mapped live
+  from the same shallow-water simulation, so stirring and sipping ripple in
+  3D. Arrow keys orbit, `o` toggles auto-orbit. ~30 ms/frame at 90×30 —
   no numpy, no GPU, just sphere tracing in a `for` loop.
 
-![3d](screenshots/cup3d_cyber.png)
+![3d](screenshots/cup3d_steam.png)
 
 ## Usage
 
@@ -67,6 +90,7 @@ caf-art [preset] [flags]
 |-----|--------|
 | `s` | take a sip — the level drops; refills with a pour when low |
 | `space` | stir — an orbiting spoon churns the surface |
+| `x` | nudge the cup (careful — it's a rigid body and it remembers) |
 | `w` | steam writes the current time |
 | `t` | cycle themes |
 | `q` | quit (Ctrl+C works too) |
@@ -75,10 +99,12 @@ caf-art [preset] [flags]
 
 | flag | effect |
 |------|--------|
+| `--3d` | ray-marched cup: soft shadows, reflective liquid, volumetric steam; arrows orbit, `o` auto-orbit |
 | `--pomodoro N` | the coffee **is** the timer: drains over N minutes of work, rings and refills over a 5-minute break, repeats — steam spells `BREAK` and `GO` |
 | `--weather` | fetch local weather once (wttr.in): rain streaks, drifting snow, or a warm sun halo |
 | `--zen` | screensaver mode: no status line, slow theme crossfades, occasional auto-stirs |
 | `--hires` | kitty graphics protocol output (Ghostty, kitty) |
+| `--sound` | procedural foley through `afplay` (macOS) |
 
 ## Custom themes
 

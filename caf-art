@@ -8,9 +8,17 @@ the liquid surface — sipping, stirring, refilling, and CPU heat all disturb th
 same physical surface. Only changed lines are re-emitted each frame, and the
 layout recomputes from the terminal size every frame.
 
+The cup is also a rigid body: real IMU tilt (M2+ MacBooks) slants the liquid,
+and past ~15 degrees it runs over the rim, streaks down the cup, stains the
+saucer, and pools on the floor against the terminal walls. Tip further (or
+shove hard) and the cup slides off the saucer, tumbles, bounces off the
+window edges, and shatters coffee everywhere — housekeeping restores order a
+few seconds later. The ambient light sensor dims the scene with the room.
+
 Interactive keys while running:
   s      take a sip (refills with a pour animation when the cup runs low)
   space  stir the coffee
+  x      nudge the cup (careful)
   w      steam writes the current time
   t      cycle themes
   q      quit (Ctrl+C also works)
@@ -23,6 +31,9 @@ Flags:
                  occasional automatic stirs
   --hires        render as real images via the kitty graphics protocol
                  (Ghostty/kitty); falls back to ANSI elsewhere
+  --3d           ray-marched SDF cup with soft shadows, a reflective liquid,
+                 and volumetric steam that orbits with the camera
+  --sound        procedural foley (clink/glug/slurp/chime/crash) via afplay
 
 User themes: ~/.config/caf/themes.toml, e.g.
   [mytheme]
@@ -198,6 +209,8 @@ FONT = {
     "K": ("101", "110", "100", "110", "101"),
     "G": ("111", "100", "101", "101", "111"),
     "O": ("111", "101", "101", "101", "111"),
+    "P": ("110", "101", "110", "100", "100"),
+    "S": ("011", "100", "010", "001", "110"),
     " ": ("000", "000", "000", "000", "000"),
 }
 
@@ -297,9 +310,9 @@ def project3d(scene, wx, wy, wz):
 def render3d(scene):
     """Sphere-trace the scene into a px buffer (None = background)."""
     Wf, Hf = scene.W, scene.H
-    half = (Wf * Hf > 9000 and not scene.S) or Wf * Hf > 26000
+    half = (Wf * Hf > 9000 and not scene.S) or Wf * Hf > 14000
     W, Hpx = (Wf // 2, Hf // 2) if half else (Wf, Hf)
-    th = scene.theme
+    th = scene._th
     cup_col, liq_col, crema, sauc_col = th["cup"], th["liquid"], th["crema"], th["saucer"]
     liq_y = 0.30 + 0.62 * scene.level
     ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz = cam3d(*cam_angles(scene))
@@ -307,6 +320,8 @@ def render3d(scene):
     ws = scene.water.sample
     aspect = W / Hpx
     px = [[None] * W for _ in range(Hpx)]
+    zb = [[1e9] * W for _ in range(Hpx)]     # hit distances, for steam occlusion
+    scene._zb = (zb, W, Hpx)
     ocy = ey - 0.45
     c_sph = ex * ex + ocy * ocy + ez * ez - 2.6244   # bounding sphere r=1.62
     sdf = sdf3d
@@ -342,6 +357,7 @@ def render3d(scene):
                     break
             if mat < 0:
                 continue
+            zb[j][i] = t
             e = 0.004
             nx = sdf(pxx + e, pyy, pzz, liq_y)[0] - sdf(pxx - e, pyy, pzz, liq_y)[0]
             ny = sdf(pxx, pyy + e, pzz, liq_y)[0] - sdf(pxx, pyy - e, pzz, liq_y)[0]
@@ -359,15 +375,56 @@ def render3d(scene):
             diff = nx * lx + ny * ly + nz * lz
             if diff < 0:
                 diff = 0.0
+            elif diff > 0.02:                 # one soft shadow ray per hit
+                sh = 1.0
+                ts = 0.05
+                ox, oy, oz = pxx + nx * 0.008, pyy + ny * 0.008, pzz + nz * 0.008
+                for _ in range(20):
+                    dsh = sdf(ox + lx * ts, oy + ly * ts, oz + lz * ts, liq_y)[0]
+                    if dsh < 0.0012:
+                        sh = 0.0
+                        break
+                    pen = 10.0 * dsh / ts
+                    if pen < sh:
+                        sh = pen
+                    ts += dsh if dsh > 0.02 else 0.02
+                    if ts > 2.2 or sh < 0.05:
+                        break
+                sh = max(0.0, sh)
+                diff *= 0.22 + 0.78 * sh
+                spec_sh = 0.25 + 0.75 * sh
+            else:
+                spec_sh = 1.0
             hx_, hy_, hz_ = lx - dx, ly - dy, lz - dz
             hl = math.sqrt(hx_ * hx_ + hy_ * hy_ + hz_ * hz_) or 1.0
             spec = (nx * hx_ + ny * hy_ + nz * hz_) / hl
-            spec = spec ** 40 if spec > 0 else 0.0
+            spec = spec ** 40 * spec_sh if spec > 0 else 0.0
             fres = (1.0 - max(0.0, -(nx * dx + ny * dy + nz * dz))) ** 2
             if mat == 2:
                 base = tuple(int(a + (b - a) * min(1.0, 0.18 + diff * 0.45 + spec * 0.6))
                              for a, b in zip(liq_col, crema))
                 k = 0.38 + 0.7 * diff
+                # one reflection bounce: the liquid mirrors the cup's inner
+                # wall and rim light, weighted by fresnel
+                nd = nx * dx + ny * dy + nz * dz
+                rdx, rdy, rdz = dx - 2 * nd * nx, dy - 2 * nd * ny, dz - 2 * nd * nz
+                tr = 0.02
+                ox, oy, oz = pxx + nx * 0.012, pyy + ny * 0.012, pzz + nz * 0.012
+                rpy = 0.0
+                hitr = False
+                for _ in range(16):
+                    dr, mr = sdf(ox + rdx * tr, oy + rdy * tr, oz + rdz * tr, liq_y)
+                    if dr < 0.004:
+                        hitr = mr != 2
+                        rpy = oy + rdy * tr
+                        break
+                    tr += dr * 0.95
+                    if tr > 2.0:
+                        break
+                if hitr:
+                    rc = shade(cup_col, 0.30 + 0.55 * max(0.0, min(1.0, rpy)))
+                    krf = 0.16 + 0.45 * fres
+                    base = tuple(int(b + (c - b) * krf) for b, c in zip(base, rc))
             else:
                 base = cup_col if mat == 0 else sauc_col
                 k = 0.24 + 0.78 * diff
@@ -392,25 +449,25 @@ def render3d(scene):
 # physics: tilt slants the coffee, shoves slosh it, the gyro spins the camera.
 
 IMU_PATH = "/tmp/caf-imu.dat"
-IMU_FMT = "<4sId7f"                   # magic, ver, t(f64), ax..gz, checksum
+IMU_FMT = "<4sId8f"                   # magic, ver, t(f64), ax..gz, lux, checksum
 IMU_MAGIC = b"CIMU"
 
 
-def imu_write_sample(fd, t, a, g):
-    chk = a[0] + a[1] + a[2] + g[0] + g[1] + g[2]
-    os.pwrite(fd, struct.pack(IMU_FMT, IMU_MAGIC, 1, t, a[0], a[1], a[2],
-                              g[0], g[1], g[2], chk), 0)
+def imu_write_sample(fd, t, a, g, lux):
+    chk = a[0] + a[1] + a[2] + g[0] + g[1] + g[2] + lux
+    os.pwrite(fd, struct.pack(IMU_FMT, IMU_MAGIC, 2, t, a[0], a[1], a[2],
+                              g[0], g[1], g[2], lux, chk), 0)
 
 
 def imu_read_sample():
-    """Returns (t, (ax, ay, az), (gx, gy, gz)) or None."""
+    """Returns (t, (ax, ay, az), (gx, gy, gz), lux) or None. lux < 0 = no ALS."""
     try:
         with open(IMU_PATH, "rb") as f:
             raw = f.read(struct.calcsize(IMU_FMT))
-        magic, _ver, t, ax, ay, az, gx, gy, gz, chk = struct.unpack(IMU_FMT, raw)
-        if magic != IMU_MAGIC or abs((ax + ay + az + gx + gy + gz) - chk) > 1e-3:
+        magic, _ver, t, ax, ay, az, gx, gy, gz, lux, chk = struct.unpack(IMU_FMT, raw)
+        if magic != IMU_MAGIC or abs((ax + ay + az + gx + gy + gz + lux) - chk) > 1e-2:
             return None
-        return t, (ax, ay, az), (gx, gy, gz)
+        return t, (ax, ay, az), (gx, gy, gz), lux
     except Exception:
         return None
 
@@ -495,6 +552,8 @@ def imu_bridge(debug_secs=0, quiet=False):
             targets.setdefault("accel", svc)
         elif (up, u) == (0xFF00, 9):
             targets.setdefault("gyro", svc)
+        elif (up, u) == (0xFF00, 4):
+            targets.setdefault("als", svc)
     if "accel" not in targets:
         if not quiet:
             print("caf imu: no SPU accelerometer found (needs an M2+ MacBook)")
@@ -509,24 +568,40 @@ def imu_bridge(debug_secs=0, quiet=False):
             if not svc:
                 break
             up, u = num_prop(svc, "PrimaryUsagePage"), num_prop(svc, "PrimaryUsage")
-            if (up, u) in ((0xFF00, 3), (0xFF00, 9)):
+            if (up, u) in ((0xFF00, 3), (0xFF00, 9), (0xFF00, 4)):
                 prop_errs += enable_streaming(svc)
     if prop_errs and os.geteuid() != 0 and debug_secs:
         print(f"caf imu: {prop_errs} sensor-enable writes failed on the device "
               "layer (driver layer usually suffices; try sudo if no samples flow)")
 
-    state = {"a": (0.0, 0.0, 0.0), "g": (0.0, 0.0, 0.0), "n": 0}
+    state = {"a": (0.0, 0.0, 0.0), "g": (0.0, 0.0, 0.0), "l": -1.0, "n": 0,
+             "lraw": b""}
     CB = C.CFUNCTYPE(None, C.c_void_p, C.c_int32, C.c_void_p, C.c_uint32,
                      C.c_uint32, C.POINTER(C.c_ubyte), C.c_long, C.c_uint64)
 
     def make_cb(kind):
-        def cb(_ctx, _res, _sender, _type, _rid, report, length, _ts):
-            if length < 18:
-                return
-            data = bytes(report[:int(length)])
-            x, y, z = struct.unpack_from("<iii", data, 6)
-            state[kind[0]] = (x / 65536.0, y / 65536.0, z / 65536.0)
-            state["n"] += 1
+        if kind == "als":
+            # 64-byte report: u32 counter, u16, u32 ts, zeros, 5x u32 raw
+            # channel counts, then float32 lux at offset 40 (verified live)
+            def cb(_ctx, _res, _sender, _type, _rid, report, length, _ts):
+                if length < 44:
+                    return
+                data = bytes(report[:int(length)])
+                state["lraw"] = data
+                lux = struct.unpack_from("<f", data, 40)[0]
+                if 0.0 <= lux < 200000.0:
+                    state["l"] = lux
+                state["n"] += 1
+        else:
+            key = kind[0]
+
+            def cb(_ctx, _res, _sender, _type, _rid, report, length, _ts):
+                if length < 18:
+                    return
+                data = bytes(report[:int(length)])
+                x, y, z = struct.unpack_from("<iii", data, 6)
+                state[key] = (x / 65536.0, y / 65536.0, z / 65536.0)
+                state["n"] += 1
         return CB(cb)
 
     refs = []                          # keep callbacks + buffers alive
@@ -566,17 +641,128 @@ def imu_bridge(debug_secs=0, quiet=False):
             cf.CFRunLoopRunInMode(
                 C.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode"), 0.03, False)
             now = time.monotonic()
-            imu_write_sample(fd, now, state["a"], state["g"])
+            imu_write_sample(fd, now, state["a"], state["g"], state["l"])
             if debug_secs and now - last_dbg > 0.25:
                 last_dbg = now
                 a, g = state["a"], state["g"]
+                als = (f"  lux={state['l']:8.2f} raw[{len(state['lraw'])}]="
+                       f"{state['lraw'].hex()}" if state["lraw"] else "")
                 print(f"n={state['n']:6d}  a=({a[0]:+.3f},{a[1]:+.3f},{a[2]:+.3f})g"
-                      f"  gyro=({g[0]:+7.2f},{g[1]:+7.2f},{g[2]:+7.2f})dps")
+                      f"  gyro=({g[0]:+7.2f},{g[1]:+7.2f},{g[2]:+7.2f})dps" + als)
     except KeyboardInterrupt:
         pass
     finally:
         os.close(fd)
     return 0
+
+
+# --------------------------------------------------------------------------
+# Sound (--sound): tiny procedurally generated WAVs played through afplay
+# --------------------------------------------------------------------------
+
+SND_RATE = 22050
+
+
+class SoundKit:
+    """Synthesizes a handful of foley WAVs once, plays them via afplay."""
+
+    def __init__(self):
+        self.dir = os.path.expanduser("~/.cache/caf/sounds")
+        self.ok = sys.platform == "darwin" and shutil.which("afplay") is not None
+        self._last = {}
+        if self.ok:
+            try:
+                os.makedirs(self.dir, exist_ok=True)
+                self._generate()
+            except OSError:
+                self.ok = False
+
+    def play(self, name, vol=0.5):
+        if not self.ok:
+            return
+        now = time.monotonic()
+        if now - self._last.get(name, 0.0) < 0.18:
+            return
+        self._last[name] = now
+        path = os.path.join(self.dir, name + ".wav")
+        if os.path.exists(path):
+            try:
+                subprocess.Popen(["afplay", "-v", f"{vol:.2f}", path],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError:
+                self.ok = False
+
+    def _write(self, name, samples):
+        import wave
+        path = os.path.join(self.dir, name + ".wav")
+        if os.path.exists(path):
+            return
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SND_RATE)
+            w.writeframes(b"".join(
+                struct.pack("<h", max(-32767, min(32767, int(s * 32767))))
+                for s in samples))
+
+    def _generate(self):
+        R = SND_RATE
+        rnd = random.Random(7)
+
+        # clink: struck ceramic — a few bright partials, fast decay
+        n = int(R * 0.22)
+        self._write("clink", [
+            sum(A * math.sin(2 * math.pi * f * i / R) * math.exp(-i / (R * d))
+                for f, A, d in ((2350, 0.5, 0.03), (3170, 0.35, 0.022),
+                                (5230, 0.2, 0.014)))
+            * min(1.0, i / (R * 0.002)) for i in range(n)])
+
+        # drip: a short blip sliding up in pitch
+        n = int(R * 0.12)
+        self._write("drip", [
+            0.5 * math.sin(2 * math.pi * (900 + 700 * (i / n) ** 2) * i / R)
+            * math.exp(-i / (R * 0.04)) for i in range(n)])
+
+        # glug: three descending bubbles
+        out = []
+        for b in range(3):
+            f0 = 320 - b * 60
+            n = int(R * 0.14)
+            for i in range(n):
+                f = f0 * (1 - 0.4 * i / n)
+                out.append(0.55 * math.sin(2 * math.pi * f * i / R)
+                           * math.sin(math.pi * i / n))
+            out.extend([0.0] * int(R * 0.03))
+        self._write("glug", out)
+
+        # slurp: filtered noise swelling with a little flutter
+        n = int(R * 0.4)
+        lp = 0.0
+        out = []
+        for i in range(n):
+            lp += (rnd.uniform(-1, 1) - lp) * 0.18
+            a = math.sin(math.pi * min(1.0, i / (n * 0.85))) ** 1.5
+            out.append(lp * a * 0.9 * (1 + 0.3 * math.sin(2 * math.pi * 11 * i / R)))
+        self._write("slurp", out)
+
+        # chime: soft bell for the pomodoro
+        n = int(R * 1.1)
+        self._write("chime", [
+            (0.4 * math.sin(2 * math.pi * 880 * i / R)
+             + 0.25 * math.sin(2 * math.pi * 1318.5 * i / R))
+            * math.exp(-i / (R * 0.35)) for i in range(n)])
+
+        # crash: the cup meets the floor — noise burst + ringing shards
+        n = int(R * 0.55)
+        lp = 0.0
+        out = []
+        for i in range(n):
+            lp += (rnd.uniform(-1, 1) - lp) * 0.6
+            ring = (0.3 * math.sin(2 * math.pi * 1830 * i / R) * math.exp(-i / (R * 0.08))
+                    + 0.22 * math.sin(2 * math.pi * 2710 * i / R) * math.exp(-i / (R * 0.05)))
+            out.append(lp * 0.8 * math.exp(-i / (R * 0.06)) + ring)
+        self._write("crash", out)
 
 
 # --------------------------------------------------------------------------
@@ -682,6 +868,25 @@ class Scene:
         self._imu_down = None
         self.yaw_kick = 0.0             # 3d camera parallax from window motion
         self.pitch_kick = 0.0
+        self.tilt_in = (0.0, 0.0)       # raw IMU tilt (cup rotation adds to it)
+        # --- cup rigid body: the cup can rock, spill, slide, and fall ---
+        self.cup_ang = 0.0              # lean angle (rad), + = leaning right
+        self.cup_av = 0.0
+        self.cup_dx = 0.0               # offset from the layout seat, in px
+        self.cup_dy = 0.0
+        self.cup_vx = 0.0
+        self.cup_vy = 0.0
+        self.cup_state = "seated"       # seated | airborne | floor | fallen
+        self.reset_at = None            # scene time to restore order
+        self.spills = 0
+        self.drops = []                 # spilled coffee droplets [x, y, vx, vy]
+        self.puddle = []                # per-column liquid depth on the floor
+        self.stains = {}                # saucer column -> stain intensity
+        self.snd = None                 # SoundKit.play when --sound
+        self.ambient = 1.0              # ALS-driven scene brightness
+        self._th = self.theme           # possibly dimmed copy used for drawing
+        self.flat = []                  # 3d mode: screen-space word particles
+        self._zb = None                 # 3d depth buffer (zb, W, Hpx)
 
     # ---- events ----------------------------------------------------------
 
@@ -694,6 +899,8 @@ class Scene:
     def sip(self, pomo=False):
         self.sips += 1
         self.water.disturb(0.0, 0.75, -0.55, 0.2)
+        if self.snd:
+            self.snd("slurp", 0.5)
         if not pomo:
             if self.target_level <= 0.3:
                 self.target_level = 1.0
@@ -702,9 +909,26 @@ class Scene:
 
     def stir(self):
         self.stir_t = self.t
+        if self.snd:
+            self.snd("clink", 0.4)
 
     def gust(self, cols_delta):
         self.wind = max(-6.0, min(6.0, cols_delta * 0.4))
+
+    def nudge(self, k=1.0):
+        """Physically poke the cup (x key / hard window shoves)."""
+        if self.mode3d:
+            return
+        kick = random.uniform(1.6, 2.6) * k * random.choice((-1.0, 1.0))
+        self.cup_av += kick
+        self.water.disturb(-math.copysign(0.6, kick), 0.0, 0.4, 0.14)
+        if self.snd:
+            self.snd("clink", 0.35)
+
+    def ambient_light(self, lux, dt):
+        """ALS lux -> scene brightness (log response, dim room = embers)."""
+        target = max(0.30, min(1.0, 0.30 + 0.70 * math.log10(1 + lux) / 2.0))
+        self.ambient += (target - self.ambient) * min(1.0, dt * 1.5)
 
     def imu_input(self, a, g, dt):
         """Real laptop motion from the SPU IMU (a in g, gyro in deg/s)."""
@@ -723,7 +947,7 @@ class Scene:
         # tilt: gravity leaking into the horizontal axes slants the coffee
         tx = max(-0.5, min(0.5, gr[h1] * (1 if gr[d] > 0 else -1)))
         ty = max(-0.5, min(0.5, gr[h2] * (1 if gr[d] > 0 else -1)))
-        self.water.tilt = (tx * 1.6, ty * 1.6)
+        self.tilt_in = (tx * 1.6, ty * 1.6)
         self.wind += tx * 9 * dt                     # steam leans with tilt
         # linear shoves: slosh + 2.5D depth push + updraft
         mag = math.hypot(lin[h1], lin[h2])
@@ -731,6 +955,8 @@ class Scene:
             self.water.disturb(max(-0.8, min(0.8, -lin[h1] * 4)),
                                max(-0.8, min(0.8, -lin[h2] * 4)),
                                min(0.5, mag * 1.6), 0.15)
+        if mag > 0.30 and not self.mode3d:            # hard jolts rock the cup
+            self.cup_av += max(-1.6, min(1.6, lin[h1] * 4.5))
         self.z_push = max(-1.5, min(1.5, self.z_push + lin[h2] * 2.2))
         self.updraft = max(-8.0, min(8.0, self.updraft - lin[d] * 10))
         if self.mode3d:                              # gyro steers the camera
@@ -756,6 +982,8 @@ class Scene:
                 su = random.uniform(-0.3, 0.3)
             self.water.disturb(su, random.uniform(-0.4, 0.4),
                                min(0.5, speed / 4000), 0.16)
+            if not self.mode3d:                      # a real shove rocks the cup
+                self.cup_av += max(-1.8, min(1.8, vx * 0.0005))
         if self.mode3d:
             self.yaw_kick = max(-0.3, min(0.3, self.yaw_kick - vx * 0.00012))
             self.pitch_kick = max(-0.2, min(0.2, self.pitch_kick + vy * 0.00010))
@@ -780,7 +1008,10 @@ class Scene:
                                                 y0 + ry * k + sy))
         if len(targets) > 420:
             targets = random.sample(targets, 420)
-        pool = sorted(self.particles, key=lambda p: p[3])       # youngest first
+        # in 3d mode words are drawn by a separate screen-space swarm (the
+        # real steam lives in world coordinates)
+        plist = self.flat if self.mode3d else self.particles
+        pool = sorted(plist, key=lambda p: p[3])                # youngest first
         pairs = []
         for i, (bx, by) in enumerate(targets):
             if i < len(pool):
@@ -789,7 +1020,7 @@ class Scene:
                 p = [self.cx + random.gauss(0, self.cup_w * 0.2),
                      float(self.cup_top + self.rim_h // 2),
                      random.uniform(0, math.tau), 0.0, self.cup_top * 1.0, 0.0]
-                self.particles.append(p)
+                plist.append(p)
             pairs.append((p, bx / 2, by / 2))
         self.word = dict(pairs=pairs, until=self.t + 3.2)
 
@@ -812,6 +1043,10 @@ class Scene:
         self.cup_top = self.cup_bot - cup_h
         self.rim_h = max(3, cup_h // 5)
         self.steam_by = max(2, (self.cup_top + self.rim_h) * 2)
+        if len(self.puddle) != self.W:
+            self.puddle = [0.0] * self.W
+            self.drops = []
+        self.cup_dx = max(-self.cx + 4, min(self.W - self.cx - 4, self.cup_dx))
         if self.mode3d:
             self._anchor3d()
 
@@ -826,6 +1061,199 @@ class Scene:
         self.cup_top = max(2, int(cj))
         self.rim_h = max(2, int(half_w * math.sin(self.pitch)))
         self.steam_by = max(2, (self.cup_top + self.rim_h) * 2)
+
+    # ---- cup rigid body: rocking, spilling, sliding, falling -------------
+
+    def _spawn_drops(self, n, side, splash=False):
+        hw0 = self.cup_w / 2
+        rx = self.cx + self.cup_dx + side * hw0 * random.uniform(0.7, 0.95)
+        ry = self.cup_top + self.cup_dy + self.rim_h * 0.5 + abs(self.cup_ang) * hw0 * 0.5
+        sc = max(1, self.S)
+        for _ in range(n):
+            self.drops.append([rx + random.uniform(-1.5, 1.5) * sc,
+                               ry + random.uniform(-1.0, 1.0) * sc,
+                               (side * random.uniform(4, 14) + self.cup_vx
+                                + (random.uniform(-22, 22) if splash else 0)) * sc,
+                               (random.uniform(-14, 2) if splash
+                                else random.uniform(-3, 3)) * sc])
+
+    def _dump_liquid(self):
+        """Everything still in the cup hits the floor."""
+        if self.level > 0.04:
+            side = math.copysign(1.0, self.cup_ang or 1.0)
+            self._spawn_drops(int(6 + self.level * 16), side, splash=True)
+        self.level = self.target_level = 0.02
+
+    def _cup_physics(self, dt):
+        t = self.t
+        st = self.cup_state
+        ch = max(6, self.cup_h)
+        hw0 = self.cup_w / 2
+        floor_y = self.H - 2
+        G = ch * 3.2
+        drive = self.tilt_in[0]
+
+        if self.reset_at is not None and t >= self.reset_at:
+            self.cup_state = "seated"
+            self.cup_ang = self.cup_av = 0.0
+            self.cup_dx = self.cup_dy = self.cup_vx = self.cup_vy = 0.0
+            self.reset_at = None
+            self.stains.clear()
+            self.target_level = 1.0
+            if self.snd:
+                self.snd("glug", 0.5)
+            return
+
+        if st in ("seated", "floor"):
+            crit = 0.35
+            torque = drive * 3.2
+            if abs(self.cup_ang) < crit:
+                torque -= self.cup_ang * 9.0
+            else:
+                torque += math.copysign((abs(self.cup_ang) - crit) * 13.0,
+                                        self.cup_ang)
+            self.cup_av = (self.cup_av + torque * dt) * math.exp(-dt * 2.2)
+            self.cup_ang += self.cup_av * dt
+            # sustained hard tilt overcomes friction: the cup starts to slide
+            if abs(drive) > 0.55:
+                self.cup_vx += (drive - math.copysign(0.55, drive)) * ch * 2.4 * dt
+            self.cup_vx *= math.exp(-dt * 3.0)
+            self.cup_dx += self.cup_vx * dt
+            if st == "seated":
+                s_hw = self.cup_w * 0.75
+                if abs(self.cup_dx) > s_hw - hw0 * 0.35:      # off the saucer edge
+                    self.cup_state = "airborne"
+                    self.spills += 1
+                    self.cup_vy = 0.0
+                    self.cup_av += math.copysign(random.uniform(0.8, 1.6),
+                                                 self.cup_dx)
+                    if self.snd:
+                        self.snd("clink", 0.6)
+            else:
+                lim = self.W - hw0 - 2 - self.cx
+                self.cup_dx = max(hw0 + 2 - self.cx, min(lim, self.cup_dx))
+            if abs(self.cup_ang) > 1.0:                       # past the point of no return
+                self.cup_state = "airborne"
+                if st == "seated":
+                    self.spills += 1
+                self.cup_av += math.copysign(1.4, self.cup_ang)
+            # liquid over the rim: level + slosh + lean decide the overflow
+            eff = drive + self.cup_ang * 2.0
+            head = self.level * 0.45 + abs(eff) * 0.38 + abs(self.cup_ang) * 0.30
+            if head > 0.75 and self.level > 0.06:
+                exc = min(0.5, head - 0.75)
+                self.level = max(0.02, self.level - exc * 2.6 * dt)
+                self.target_level = min(self.target_level, self.level)
+                if random.random() < exc * 22 * dt + 0.1:
+                    self._spawn_drops(random.randint(1, 3),
+                                      math.copysign(1.0, eff))
+                if self.snd and random.random() < dt * 1.5:
+                    self.snd("drip", 0.4)
+                if self.reset_at is None and self.level < 0.5:
+                    self.spills += 1
+                    self.reset_at = t + 11.0      # housekeeping brings a refill
+
+        elif st == "airborne":
+            self.cup_vy += G * dt
+            self.cup_vx *= math.exp(-dt * 0.3)
+            self.cup_dx += self.cup_vx * dt
+            self.cup_dy += self.cup_vy * dt
+            self.cup_ang += self.cup_av * dt
+            self.cup_av *= math.exp(-dt * 0.4)
+            wx = self.cx + self.cup_dx                        # terminal walls
+            if wx < hw0 + 2:
+                self.cup_dx += hw0 + 2 - wx
+                self.cup_vx = abs(self.cup_vx) * 0.5
+                self.cup_av = -self.cup_av * 0.6
+                if self.snd:
+                    self.snd("clink", 0.5)
+            elif wx > self.W - hw0 - 2:
+                self.cup_dx -= wx - (self.W - hw0 - 2)
+                self.cup_vx = -abs(self.cup_vx) * 0.5
+                self.cup_av = -self.cup_av * 0.6
+                if self.snd:
+                    self.snd("clink", 0.5)
+            if abs(self.cup_ang) > 0.6:                       # coffee pours out mid-air
+                self._dump_liquid()
+            if self.cup_bot + self.cup_dy >= floor_y:         # floor contact
+                self.cup_dy = floor_y - self.cup_bot
+                if self.cup_vy > G * 0.30:                    # hard hit: bounce
+                    self.cup_vy = -self.cup_vy * 0.36
+                    self.cup_vx *= 0.75
+                    self.cup_av = self.cup_av * 0.5 + random.uniform(-0.8, 0.8)
+                    if self.snd:
+                        self.snd("crash", 0.8)
+                elif abs(self.cup_ang) < 0.30 and abs(self.cup_av) < 1.2:
+                    self.cup_state = "floor"                  # stuck the landing!
+                    self.cup_vy = 0.0
+                    self.cup_ang *= 0.5
+                    if self.reset_at is None:
+                        self.reset_at = t + 12.0
+                    if self.snd:
+                        self.snd("clink", 0.7)
+                else:                                         # tipped over for good
+                    self.cup_state = "fallen"
+                    self.cup_vy = self.cup_vx = self.cup_av = 0.0
+                    self.cup_ang = math.copysign(math.pi / 2 + 0.05,
+                                                 self.cup_ang or 1.0)
+                    self._dump_liquid()
+                    self.reset_at = t + 9.0
+                    self.write_word("OOPS")
+                    if self.snd:
+                        self.snd("crash", 1.0)
+
+    def _drops_step(self, dt):
+        sc = max(1, self.S)
+        ch = max(6, self.cup_h)
+        G = ch * 3.2
+        floor_y = self.H - 2
+        s_hw = self.cup_w * 0.75
+        keep = []
+        for d in self.drops:
+            d[3] += G * dt
+            d[0] += d[2] * dt
+            d[1] += d[3] * dt
+            if d[0] < 1:
+                d[0], d[2] = 1.0, abs(d[2]) * 0.4
+            elif d[0] > self.W - 2:
+                d[0], d[2] = self.W - 2.0, -abs(d[2]) * 0.4
+            on_saucer = (self.cup_bot - 1 <= d[1] <= self.cup_bot + self.saucer_h
+                         and abs(d[0] - self.cx) < s_hw * 0.97 and d[3] > 0)
+            if on_saucer:
+                xi = int(d[0])
+                self.stains[xi] = min(1.0, self.stains.get(xi, 0.0) + 0.30)
+                if random.random() < 0.35:                    # splashes off the rim
+                    d[2] += math.copysign(random.uniform(4, 9) * sc, d[0] - self.cx)
+                    d[3] = -d[3] * 0.3
+                    keep.append(d)
+                continue
+            if d[1] >= floor_y:
+                xi = max(0, min(self.W - 1, int(d[0])))
+                self.puddle[xi] += 0.55 * sc
+                continue
+            keep.append(d)
+        self.drops = keep
+        # the puddle spreads along the floor, held in by the terminal walls
+        p = self.puddle
+        if any(v > 0.01 for v in p):
+            W = self.W
+            k = min(0.45, dt * 7.0)
+            ev = dt * (0.05 * sc if self.reset_at is None else 0.16 * sc)
+            prev = p[0]
+            for x in range(W):
+                left = prev
+                right = p[x + 1] if x < W - 1 else p[x]
+                prev = p[x]
+                p[x] += ((left + right) / 2 - p[x]) * k
+                p[x] = max(0.0, p[x] - ev)
+            if self.heat > 0.15 and random.random() < 0.5:    # wisps off hot spill
+                wet = [x for x in range(0, W, 3) if p[x] > 0.3 * sc]
+                if wet:
+                    x = random.choice(wet) + random.uniform(-1, 1)
+                    self.particles.append([x, float(self.H - 4),
+                                           random.uniform(0, math.tau), 0.0,
+                                           random.uniform(0.4, 0.7) * self.cup_top,
+                                           0.0])
 
     # ---- simulation ------------------------------------------------------
 
@@ -845,6 +1273,9 @@ class Scene:
             self._heat_at = t
             self._sample_heat()
         pouring = self.target_level - self.level > 0.04
+        if pouring and not getattr(self, "_was_pouring", False) and self.snd:
+            self.snd("glug", 0.55)
+        self._was_pouring = pouring
         self.level += (self.target_level - self.level) * min(1.0, dt * (1.2 if pouring else 2.5))
         self.wind *= math.exp(-dt * 1.2)
         decay = math.exp(-dt * 1.6)
@@ -853,8 +1284,16 @@ class Scene:
         self.yaw_kick *= decay
         self.pitch_kick *= decay
 
+        # --- cup body + spilled coffee ---
+        if not self.mode3d:
+            self._cup_physics(dt)
+            if self.drops or any(v > 0.01 for v in self.puddle):
+                self._drops_step(dt)
+
         # --- water surface ---
         w = self.water
+        w.tilt = (self.tilt_in[0] + (0.0 if self.mode3d else self.cup_ang * 2.0),
+                  self.tilt_in[1])
         w.step()
         if random.random() < 0.25 + self.heat * 0.5:            # thermal jitter
             w.disturb(random.uniform(-0.7, 0.7), random.uniform(-0.7, 0.7),
@@ -870,16 +1309,6 @@ class Scene:
 
         # --- steam particles ---
         heat_k = 0.5 + 0.9 * self.heat
-        rate = max(2, int((self.cup_w // 5) * (0.25 + 0.75 * self.level) * heat_k))
-        for _ in range(rate):
-            if random.random() < 0.65:
-                k = random.randrange(3)
-                plume = self.cx + math.sin(t * 0.6 + k * 2.1) * self.cup_w * 0.24
-                self.particles.append([plume + random.gauss(0, 1.2),
-                                       float(self.cup_top + self.rim_h // 2),
-                                       random.uniform(0, math.tau), 0.0,
-                                       random.uniform(0.7, 1.05) * self.cup_top, 0.0])
-
         word_set = set()
         if self.word:
             if t > self.word["until"]:
@@ -893,23 +1322,77 @@ class Scene:
                     p[1] += (ty - p[1]) * ease
                     word_set.add(id(p))
 
-        alive = []
-        top = max(1, self.cup_top)
-        speed = 1.0 + 0.5 * self.heat
-        for p in self.particles:
-            if id(p) in word_set:
-                alive.append(p)
-                continue
-            s = 6 + 22 * max(0.0, 1 - p[1] / top)
-            nx, ny = curl(p[0] * 0.08 / max(1, self.S), p[1] * 0.08 / max(1, self.S), )
-            sc = max(1, self.S)
-            p[0] += (nx * s * sc + math.sin(t * 0.5) * 1.2 * sc + self.wind * 6 * sc * 0.1) * dt * 2.2
-            p[1] -= (13 + 7 * math.sin(p[2]) - ny * s * 0.6 + self.updraft * 5) * dt * 1.35 * sc * speed
-            p[5] += (self.z_push - p[5]) * min(1.0, dt * 2.5)
-            p[3] += dt * 22
-            if p[3] < p[4] and p[1] > 1:
-                alive.append(p)
-        self.particles = alive
+        if self.mode3d:
+            # world-space wisps rising off the liquid surface
+            liq_y = 0.30 + 0.62 * self.level
+            rate = int((2 + self.heat * 4) * (0.4 + 0.6 * self.level))
+            if self.level < 0.05:
+                rate = 0
+            for _ in range(rate):
+                if random.random() < 0.6:
+                    r = math.sqrt(random.random()) * 0.5
+                    aa = random.uniform(0, math.tau)
+                    self.particles.append([r * math.cos(aa), liq_y + 0.02,
+                                           r * math.sin(aa),
+                                           random.uniform(0, math.tau), 0.0,
+                                           random.uniform(1.8, 3.2)])
+            alive = []
+            for p in self.particles:
+                n1, _ = curl(p[0] * 1.6 + t * 0.25, p[1] * 1.6)
+                n3 = vnoise(p[2] * 1.6, p[1] * 1.6 + t * 0.25) - 0.5
+                rise = ((0.30 + 0.18 * self.heat + self.updraft * 0.05)
+                        * (1 + 0.25 * math.sin(p[3] + p[1] * 2.2)))
+                p[0] += (n1 * 0.38 + self.wind * 0.045) * dt
+                p[1] += rise * dt
+                p[2] += n3 * 0.55 * dt
+                p[4] += dt
+                if p[4] < p[5] and p[1] < 2.8:
+                    alive.append(p)
+            self.particles = alive
+            # screen-space particles that spell steam words
+            alive = []
+            for p in self.flat:
+                if id(p) in word_set:
+                    alive.append(p)
+                    continue
+                nx, ny = curl(p[0] * 0.08, p[1] * 0.08)
+                p[0] += (nx * 10 + math.sin(t * 0.5) * 1.2) * dt * 2.2
+                p[1] -= (13 + 7 * math.sin(p[2]) - ny * 6) * dt * 1.35
+                p[3] += dt * 22
+                if p[3] < p[4] and p[1] > 1:
+                    alive.append(p)
+            self.flat = alive
+        else:
+            rate = max(2, int((self.cup_w // 5) * (0.25 + 0.75 * self.level) * heat_k))
+            if self.cup_state == "fallen" or self.level < 0.05:
+                rate = 0
+            for _ in range(rate):
+                if random.random() < 0.65:
+                    k = random.randrange(3)
+                    plume = (self.cx + self.cup_dx
+                             + math.sin(t * 0.6 + k * 2.1) * self.cup_w * 0.24)
+                    self.particles.append([plume + random.gauss(0, 1.2),
+                                           float(self.cup_top + self.cup_dy + self.rim_h // 2),
+                                           random.uniform(0, math.tau), 0.0,
+                                           random.uniform(0.7, 1.05) * self.cup_top, 0.0])
+
+            alive = []
+            top = max(1, self.cup_top)
+            speed = 1.0 + 0.5 * self.heat
+            for p in self.particles:
+                if id(p) in word_set:
+                    alive.append(p)
+                    continue
+                s = 6 + 22 * max(0.0, 1 - p[1] / top)
+                nx, ny = curl(p[0] * 0.08 / max(1, self.S), p[1] * 0.08 / max(1, self.S), )
+                sc = max(1, self.S)
+                p[0] += (nx * s * sc + math.sin(t * 0.5) * 1.2 * sc + self.wind * 6 * sc * 0.1) * dt * 2.2
+                p[1] -= (13 + 7 * math.sin(p[2]) - ny * s * 0.6 + self.updraft * 5) * dt * 1.35 * sc * speed
+                p[5] += (self.z_push - p[5]) * min(1.0, dt * 2.5)
+                p[3] += dt * 22
+                if p[3] < p[4] and p[1] > 1:
+                    alive.append(p)
+            self.particles = alive
 
         # --- weather ---
         sc = max(1, self.S)
@@ -937,18 +1420,33 @@ class Scene:
 
     # ---- drawing ---------------------------------------------------------
 
+    def _dim_theme(self):
+        amb = self.ambient
+        if amb >= 0.975:
+            self._th = self.theme
+        else:
+            th = dict(self.theme)
+            for k in COLOR_KEYS:
+                # steam dims less: it catches what light remains
+                th[k] = shade(self.theme[k], amb ** 0.5 if k == "steam" else amb)
+            self._th = th
+        return self._th
+
     def draw(self):
+        th = self._dim_theme()
         if self.mode3d:
             px = render3d(self)
-            sgrid = [[0.0] * (self.W * 2) for _ in range(self.steam_by)] if not self.S else None
             if self.S:
-                self._splat_hires(px)
+                sgrid = None
+                self._splat3d(px, None)
+                self._splat_hires(px, self.flat)
             else:
-                self._splat_braille(px, sgrid)
+                sgrid = [[0.0] * (self.W * 2) for _ in range(self.H * 2)]
+                self._splat3d(px, sgrid)
+                self._splat_braille(px, sgrid, self.flat)
             return px, sgrid
         W, H = self.W, self.H
         px = [[None] * W for _ in range(H)]
-        th = self.theme
         t = self.t
         cx, cup_w, cup_h = self.cx, self.cup_w, self.cup_h
         top, bot, rim_h = self.cup_top, self.cup_bot, self.rim_h
@@ -964,8 +1462,9 @@ class Scene:
                     if d < 1:
                         px[y][x] = mix(BG_COL, (120, 84, 30), (1 - d) * 0.5)
 
-        # saucer
+        # saucer (stays put; collects coffee stains on its top surface)
         s_w = cup_w * 1.5
+        stains = self.stains
         for j in range(self.saucer_h):
             tt = j / max(1, self.saucer_h - 1)
             hw = (s_w / 2) * math.sqrt(max(0.0, 1 - (tt * 0.85) ** 2))
@@ -975,39 +1474,52 @@ class Scene:
             for x in range(int(cx - hw), int(cx + hw) + 1):
                 if 0 <= x < W:
                     k = 0.9 - 0.45 * tt + 0.25 * math.exp(-((x - cx + hw * 0.3) / (hw * 0.45 + 1)) ** 2)
-                    px[y][x] = shade(th["saucer"], k)
+                    col = shade(th["saucer"], k)
+                    if stains and j <= 1:
+                        s = stains.get(x, 0.0)
+                        if s:
+                            col = mix(col, shade(th["liquid"], 0.55), min(0.75, s * 0.75))
+                    px[y][x] = col
 
-        # cup body
-        for j in range(rim_h // 2, cup_h + 1):
+        # cup (body + handle + rim + liquid) rendered into its own buffer so
+        # the whole thing can lean, slide, and tumble as one rigid body
+        hr = max(3, int(cup_h * 0.30))
+        thick = max(1.4, cup_h * 0.07)
+        bx0 = int(cx - hw0) - 3
+        bx1 = int(cx + hw0 * 0.92 + hr + thick) + 3
+        by0 = top - 2
+        bw, bh = bx1 - bx0 + 1, cup_h + 5
+        cb = [[None] * bw for _ in range(bh)]
+
+        for j in range(rim_h // 2, cup_h + 1):                 # body
             tt = j / cup_h
             hw = hw0 * (1 - 0.16 * tt)
             if tt > 0.78:
                 hw *= math.sqrt(max(0.0, 1 - ((tt - 0.78) / 0.24) ** 2))
-            y = top + j
-            if not (0 <= y < H) or hw < 1:
+            if hw < 1:
                 continue
+            row = cb[top + j - by0]
             for x in range(int(cx - hw), int(cx + hw) + 1):
-                if 0 <= x < W:
-                    u = max(-1.0, min(1.0, (x - cx) / (hw + 1e-6)))
-                    k = 0.52 + 0.30 * (1 - abs(u)) ** 0.7
-                    k += 0.34 * math.exp(-((u + 0.45) / 0.28) ** 2)
-                    k -= 0.18 * max(0.0, u - 0.55)
-                    k *= 1.0 - 0.22 * tt
-                    px[y][x] = shade(th["cup"], k)
+                u = max(-1.0, min(1.0, (x - cx) / (hw + 1e-6)))
+                k = 0.52 + 0.30 * (1 - abs(u)) ** 0.7
+                k += 0.34 * math.exp(-((u + 0.45) / 0.28) ** 2)
+                k -= 0.18 * max(0.0, u - 0.55)
+                k *= 1.0 - 0.22 * tt
+                row[x - bx0] = shade(th["cup"], k)
 
-        # handle
-        hr = max(3, int(cup_h * 0.30))
-        hcx, hcy = cx + hw0 * 0.92, top + cup_h * 0.45
-        thick = max(1.4, cup_h * 0.07)
+        hcx, hcy = cx + hw0 * 0.92, top + cup_h * 0.45         # handle
         for y in range(int(hcy - hr - thick), int(hcy + hr + thick) + 1):
+            ly = y - by0
+            if not (0 <= ly < bh):
+                continue
+            row = cb[ly]
             for x in range(int(hcx), int(hcx + hr + thick) + 1):
-                if not (0 <= x < W and 0 <= y < H):
+                lx = x - bx0
+                if not (0 <= lx < bw):
                     continue
                 d = math.hypot((x - hcx) * 0.78, y - hcy)
-                if abs(d - hr) <= thick and x >= hcx + 1:
-                    k = 0.55 + 0.3 * (1 - abs(d - hr) / thick)
-                    if px[y][x] is None or self.weather == "sun":
-                        px[y][x] = shade(th["cup"], k)
+                if abs(d - hr) <= thick and x >= hcx + 1 and row[lx] is None:
+                    row[lx] = shade(th["cup"], 0.55 + 0.3 * (1 - abs(d - hr) / thick))
 
         # rim + liquid: the water sim provides height + slope lighting
         ls = 0.45 + 0.55 * self.level
@@ -1016,20 +1528,18 @@ class Scene:
         for j in range(rim_h + 1):
             v = (j - rim_h / 2) / (rim_h / 2 + 1e-6)
             hw = hw0 * math.sqrt(max(0.0, 1 - v * v))
-            y = top + j
-            if not (0 <= y < H) or hw < 1:
+            if hw < 1:
                 continue
+            row = cb[top + j - by0]
             for x in range(int(cx - hw), int(cx + hw) + 1):
-                if not (0 <= x < W):
-                    continue
                 u = (x - cx) / (hw + 1e-6)
                 if abs(u) > 0.86 or j == 0:
-                    px[y][x] = shade(th["cup"], 1.05 - 0.25 * abs(u))
+                    row[x - bx0] = shade(th["cup"], 1.05 - 0.25 * abs(u))
                     continue
                 lu = u / (0.86 * ls)
                 lv = (v - voff) / max(0.35, ls)
                 if lu * lu + lv * lv > 1.0:
-                    px[y][x] = shade(th["cup"], 0.30 + 0.08 * v)
+                    row[x - bx0] = shade(th["cup"], 0.30 + 0.08 * v)
                     continue
                 hgt = wsamp(lu, lv)
                 slope = (wsamp(lu + 0.09, lv) - hgt) + (wsamp(lu, lv + 0.09) - hgt)
@@ -1040,7 +1550,37 @@ class Scene:
                     col = mix(col, th["crema"], 0.35)
                 gl = math.exp(-((lu + 0.35) ** 2 + (lv + 0.3) ** 2) / 0.18)
                 col = mix(col, (255, 255, 255), 0.10 * gl)
-                px[y][x] = col
+                row[x - bx0] = col
+
+        self._composite_cup(px, cb, bx0, by0, bw, bh)
+
+        # floor puddle: spilled coffee pooling against the terminal walls
+        p = self.puddle
+        sc_ = max(1, self.S)
+        if any(v > 0.05 for v in p):
+            liq = th["liquid"]
+            cap = 4.0 * sc_
+            for x in range(W):
+                dpt = min(cap, p[x])
+                if dpt < 0.15:
+                    continue
+                dep = max(1, int(dpt))
+                for y in range(H - 1, max(-1, H - 1 - dep), -1):
+                    px[y][x] = shade(liq, 0.65)
+                ty_ = H - 1 - dep
+                if 0 <= ty_ < H:
+                    px[ty_][x] = mix(shade(liq, 0.85), th["crema"], 0.2)
+
+        # flying droplets
+        if self.drops:
+            dc = mix(th["liquid"], th["crema"], 0.3)
+            for d in self.drops:
+                xi, yi = int(d[0]), int(d[1])
+                for dy2 in range(sc_):
+                    for dx2 in range(max(1, sc_ // 2)):
+                        X, Y = xi + dx2, yi + dy2
+                        if 0 <= X < W and 0 <= Y < H:
+                            px[Y][X] = dc
 
         # pour stream while refilling
         sc = th["steam"]
@@ -1054,19 +1594,135 @@ class Scene:
                     if 0 <= xi < W:
                         px[y][xi] = mix(liq_col, sc, 0.25)
 
-        # steam + precip
-        sgrid = [[0.0] * (W * 2) for _ in range(self.steam_by)] if not self.S else None
+        # steam + precip (grid covers the whole screen during a spill so
+        # wisps can rise off the puddle)
         if self.S:
+            sgrid = None
             self._splat_hires(px)
         else:
+            act = (self.cup_state != "seated" or self.drops
+                   or any(v > 0.05 for v in p))
+            sgrid = [[0.0] * (W * 2) for _ in range(H * 2 if act else self.steam_by)]
             self._splat_braille(px, sgrid)
         return px, sgrid
 
-    def _splat_braille(self, px, sgrid):
+    def _composite_cup(self, px, cb, bx0, by0, bw, bh):
+        """Blit the cup buffer, rotated about its pivot and translated."""
         W, H = self.W, self.H
-        sc = self.theme["steam"]
+        ang, ddx, ddy = self.cup_ang, self.cup_dx, self.cup_dy
+        if abs(ang) < 0.02 and abs(ddx) < 0.5 and abs(ddy) < 0.5:
+            for y in range(bh):
+                ty = y + by0
+                if not (0 <= ty < H):
+                    continue
+                row, prow = cb[y], px[ty]
+                for x in range(bw):
+                    c = row[x]
+                    if c is not None:
+                        tx = x + bx0
+                        if 0 <= tx < W:
+                            prow[tx] = c
+            return
+        # grounded cups rock on the bottom corner of the leaning side
+        pvx = self.cx + (math.copysign(self.cup_w * 0.26, ang)
+                         if self.cup_state in ("seated", "floor") else 0.0)
+        pvy = float(self.cup_bot)
+        ca, sa = math.cos(ang), math.sin(ang)
+        xs, ys = [], []
+        for X, Y in ((bx0, by0), (bx0 + bw, by0),
+                     (bx0, by0 + bh), (bx0 + bw, by0 + bh)):
+            rx_, ry_ = X - pvx, Y - pvy
+            xs.append(pvx + ca * rx_ - sa * ry_ + ddx)
+            ys.append(pvy + sa * rx_ + ca * ry_ + ddy)
+        xmin, xmax = max(0, int(min(xs)) - 1), min(W - 1, int(max(xs)) + 1)
+        ymin, ymax = max(0, int(min(ys)) - 1), min(H - 1, int(max(ys)) + 1)
+        lox, loy = pvx - bx0, pvy - by0
+        for yd in range(ymin, ymax + 1):
+            prow = px[yd]
+            wy = yd - ddy - pvy
+            rx_off = lox + sa * wy
+            ry_off = loy + ca * wy
+            for xd in range(xmin, xmax + 1):
+                wx = xd - ddx - pvx
+                sxi = int(rx_off + ca * wx + 0.5)
+                syi = int(ry_off - sa * wx + 0.5)
+                if 0 <= sxi < bw and 0 <= syi < bh:
+                    c = cb[syi][sxi]
+                    if c is not None:
+                        prow[xd] = c
+
+    def _splat3d(self, px, sgrid):
+        """Volumetric steam: world-space wisps projected through the orbit
+        camera, occluded by the cup via the depth buffer, lit by the key."""
+        W, H = self.W, self.H
+        sc = self._th["steam"]
+        zb, zw, zh = self._zb
+        ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz = cam3d(*cam_angles(self))
+        lx, lz = -0.4082, -0.4876
+        aspect = W / H
         bw = W * 2
+        sgh = len(sgrid) if sgrid is not None else 0
+        S = self.S
         for p in self.particles:
+            wx, wy, wz, ph, age, life = p
+            cxp, cyp, czp = wx - ex, wy - ey, wz - ez
+            zc = cxp * fx + cyp * fy + czp * fz
+            if zc < 0.4:
+                continue
+            uc = (cxp * rx + czp * rz) / zc * 1.9
+            vc = (cxp * ux + cyp * uy + czp * uz) / zc * 1.9
+            i = (uc / (aspect * 0.95) + 1) / 2 * W
+            j = (1 - (vc + 0.28) / 0.95) / 2 * H
+            if not (0 <= i < W and 0 <= j < H):
+                continue
+            ii, jj = int(i) * zw // W, int(j) * zh // H
+            if zc > zb[jj][ii] + 0.04:
+                continue                              # hidden behind the cup
+            a = max(0.0, 1 - age / life) ** 1.3 * 0.9
+            a *= min(1.0, 0.25 + age * 2.2)           # fade in off the surface
+            a *= 0.6 + 0.5 * max(0.0, (wx * lx + wz * lz) + 0.6)   # key light
+            near = 3.4 / zc
+            if S:
+                R = max(1, int(S * (0.5 + (1 - a) * 0.8) * near))
+                xi0, yi0 = int(i), int(j)
+                for dy in range(-R, R + 1):
+                    yi = yi0 + dy
+                    if not (0 <= yi < H):
+                        continue
+                    row = px[yi]
+                    for dx in range(-R, R + 1):
+                        d2 = dx * dx + dy * dy
+                        if d2 > R * R:
+                            continue
+                        xi = xi0 + dx
+                        if not (0 <= xi < W):
+                            continue
+                        w = a * (1 - 0.7 * math.sqrt(d2) / R) * 0.5
+                        base = row[xi] if row[xi] is not None else BG_COL
+                        row[xi] = mix(base, sc, min(1.0, w))
+            elif px[int(j)][int(i)] is not None:
+                # in front of the cup: blend straight into the render
+                pxi, pyj = int(i), int(j)
+                px[pyj][pxi] = mix(px[pyj][pxi], sc, min(0.6, a * 0.55))
+                if pxi + 1 < W and px[pyj][pxi + 1] is not None:
+                    px[pyj][pxi + 1] = mix(px[pyj][pxi + 1], sc, min(0.4, a * 0.3))
+            else:
+                bx, by = int(i * 2), int(j * 2)
+                spread = max(1, round((1 + (1 - a) * 2) * near))
+                for dx, dy, w in ((0, 0, 1.0), (-1, 0, 0.55), (1, 0, 0.55),
+                                  (0, -1, 0.5), (0, 1, 0.35),
+                                  (-1, -1, 0.3), (1, -1, 0.3), (-1, 1, 0.22),
+                                  (1, 1, 0.22), (-2, 0, 0.15), (2, 0, 0.15)):
+                    xi, yi = bx + dx * spread, by + dy
+                    if 0 <= xi < bw and 0 <= yi < sgh:
+                        sgrid[yi][xi] += a * w
+
+    def _splat_braille(self, px, sgrid, plist=None):
+        W, H = self.W, self.H
+        sc = self._th["steam"]
+        bw = W * 2
+        sgh = len(sgrid)
+        for p in (self.particles if plist is None else plist):
             x, y, age, life, pz = p[0], p[1], p[3], p[4], p[5]
             zk = 1.0 + pz * 0.55
             a = max(0.0, 1 - age / life) ** 1.3 * 0.95
@@ -1078,23 +1734,23 @@ class Scene:
                               (-1, -1, 0.3), (1, -1, 0.3), (-1, 1, 0.22), (1, 1, 0.22),
                               (-2, 0, 0.15), (2, 0, 0.15)):
                 xi, yi = bx + dx * spread, by + dy
-                if 0 <= xi < bw and 0 <= yi < self.steam_by:
+                if 0 <= xi < bw and 0 <= yi < sgh:
                     sgrid[yi][xi] += a * w
             pyi, pxi = int(y), int(x)
             if 0 <= pxi < W and 0 <= pyi < H and px[pyi][pxi] is not None:
                 px[pyi][pxi] = mix(px[pyi][pxi], sc, min(1.0, a * 0.55))
         for qx, qy, _, vy in self.precip:
             bx, by = int(qx * 2), int(qy * 2)
-            if 0 <= bx < bw and 0 <= by < self.steam_by:
+            if 0 <= bx < bw and 0 <= by < sgh:
                 sgrid[by][bx] += 0.5
-                if self.weather == "rain" and by + 1 < self.steam_by:
+                if self.weather == "rain" and by + 1 < sgh:
                     sgrid[by + 1][bx] += 0.3
 
-    def _splat_hires(self, px):
+    def _splat_hires(self, px, plist=None):
         W, H = self.W, self.H
         S = self.S
-        sc = self.theme["steam"]
-        for p in self.particles:
+        sc = self._th["steam"]
+        for p in (self.particles if plist is None else plist):
             x, y, age, life, pz = p[0], p[1], p[3], p[4], p[5]
             a = max(0.0, 1 - age / life) ** 1.3 * 0.95
             a = min(1.0, a * (1.0 + pz * 0.35))
@@ -1125,8 +1781,9 @@ class Scene:
 
     def blit(self, px, sgrid):
         out = []
-        sc = self.theme["steam"]
-        steam_cell_rows = self.steam_by // 4 + 1
+        sc = self._th["steam"]
+        sgh = len(sgrid)
+        steam_cell_rows = sgh // 4 + 1
         for row in range(self.rows - 1):
             top, bot = px[2 * row], px[2 * row + 1]
             line = []
@@ -1142,7 +1799,7 @@ class Scene:
                             gx = x * 2 + dx
                             for dy in range(4):
                                 gy = row * 4 + dy
-                                if gy < self.steam_by:
+                                if gy < sgh:
                                     val = sgrid[gy][gx]
                                     if val > 0.12:
                                         bits |= BRAILLE_BIT[dx][dy]
@@ -1200,12 +1857,18 @@ class Scene:
         cup_bar = "▇" * n + "░" * (4 - n)
         hn = min(3, int(self.heat * 3 + 0.5))
         heat_bar = "▂▄▆"[:hn] or "·"
+        if self.cup_state != "seated":
+            extra_cup = {"airborne": " · 🫗 !!", "floor": " · 🫗 close one",
+                         "fallen": " · 🫗 spilled"}[self.cup_state]
+        else:
+            extra_cup = f" · 🫗 {self.spills}" if self.spills else ""
+        extra = extra_cup + extra
         if not interactive:
             keys = " · Ctrl+C to stop"
         elif self.mode3d:
             keys = " · [s]ip [␣]stir [←→↑↓/o]rbit [w]rite [t]heme [q]uit"
         else:
-            keys = " · [s]ip [␣]stir [w]rite [t]heme [q]uit"
+            keys = " · [s]ip [␣]stir [x]nudge [w]rite [t]heme [q]uit"
         text = f" {th['icon']}  {th['name']} · awake {clock} · cup {cup_bar} · heat {heat_bar}{extra}{keys} "
         if len(text) > width:
             text = f" {th['icon']} {clock} {cup_bar}{extra} "
@@ -1279,13 +1942,17 @@ def fetch_weather(scene):
 # --------------------------------------------------------------------------
 
 def usage():
-    print("\x1b[1mUsage:\x1b[0m caf [preset] [--3d] [--pomodoro N] [--weather] [--zen] [--hires]")
+    print("\x1b[1mUsage:\x1b[0m caf [preset] [--3d] [--pomodoro N] [--weather] [--zen] [--hires] [--sound]")
     print("\x1b[1mPresets:\x1b[0m " + ", ".join(THEMES) + "  (aliases: " + ", ".join(ALIASES) + ")")
-    print("\x1b[1mKeys:\x1b[0m s = sip, space = stir, w = write the time, t = theme, q = quit; --3d adds arrows = orbit, o = auto-orbit")
+    print("\x1b[1mKeys:\x1b[0m s = sip, space = stir, x = nudge the cup, w = write the time,")
+    print("      t = theme, q = quit; --3d adds arrows = orbit, o = auto-orbit")
     print("\x1b[1mThemes file:\x1b[0m ~/.config/caf/themes.toml")
-    print("\x1b[1mIMU:\x1b[0m auto-detected on M2+ MacBooks — real tilt slants the coffee,")
-    print("     shoves slosh it, spinning steers the 3D camera. caf-art --imu-debug [secs]")
-    print("     shows live samples; caf-art --imu-bridge runs the sensor bridge manually.")
+    print("\x1b[1mIMU:\x1b[0m auto-detected on M2+ MacBooks — real tilt slants the coffee (tip far")
+    print("     enough and it spills; the cup can slide off the saucer and hit the floor),")
+    print("     shoves slosh it, spinning steers the 3D camera, and the ambient light")
+    print("     sensor dims the scene with your room. caf-art --imu-debug [secs] shows")
+    print("     live samples; caf-art --imu-bridge runs the sensor bridge manually.")
+    print("\x1b[1mSound:\x1b[0m --sound adds procedural foley (clink/glug/slurp/crash) via afplay.")
 
 
 def main():
@@ -1300,6 +1967,7 @@ def main():
     hires = False
     weather = False
     three_d = False
+    sound = False
     i = 0
     while i < len(args):
         a = args[i]
@@ -1321,6 +1989,8 @@ def main():
             weather = True
         elif a == "--3d":
             three_d = True
+        elif a == "--sound":
+            sound = True
         elif a == "--imu-bridge":
             return imu_bridge(quiet="--quiet" in args)
         elif a == "--quiet":
@@ -1359,6 +2029,10 @@ def main():
     S = (2 if three_d else 4) if hires else 0
     scene = Scene(preset, hires_scale=S)
     scene.mode3d = three_d
+    if sound and not demo_frames:
+        kit = SoundKit()
+        if kit.ok:
+            scene.snd = kit.play
     scene._sample_heat()
     if weather:
         fetch_weather(scene)
@@ -1464,6 +2138,8 @@ def main():
                         scene.sip(pomo=bool(pomo_end))
                     elif ch == " ":
                         scene.stir()
+                    elif ch == "x":
+                        scene.nudge()
                     elif ch == "w":
                         scene.write_word(time.strftime("%H:%M"))
                     elif ch == "t":
@@ -1488,11 +2164,13 @@ def main():
                 s = imu_read_sample()
                 if s and abs(now - s[0]) < 0.6 and s[0] != imu_prev_t:
                     scene.imu_input(s[1], s[2], now - (imu_prev_t or now - 0.07))
+                    if s[3] >= 0.0:
+                        scene.ambient_light(s[3], now - (imu_prev_t or now - 0.07))
                     imu_prev_t = s[0]
                     imu_active = True
                 elif not s or abs(now - s[0]) >= 0.6:
                     if imu_active:
-                        scene.water.tilt = (0.0, 0.0)
+                        scene.tilt_in = (0.0, 0.0)
                     imu_active = False
 
             # pomodoro drives the level
@@ -1501,6 +2179,8 @@ def main():
                 rem = pomo_end - now
                 if rem <= 0:
                     sys.stdout.write("\a")
+                    if scene.snd:
+                        scene.snd("chime", 0.6)
                     if pomo_phase == "work":
                         pomo_phase = "break"
                         pomo_end = now + 5 * 60
