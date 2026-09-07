@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""caf-art — a reactive ANSI coffee scene for `caf`.
+"""caf-art — a reactive terminal coffee scene for `caf`.
+
+Supported terminals use the optional Metal APIC renderer: real 3D liquid,
+cream concentration/mixing, a movable cup, cinematic lighting and impact foley.
+The Python renderers described below remain available as fallbacks.
 
 A procedurally drawn cup of coffee rendered with half-block characters at 2x
 vertical resolution, steam rendered in braille (2x4 dots per cell) driven by a
@@ -8,7 +12,7 @@ the liquid surface — sipping, stirring, refilling, and CPU heat all disturb th
 same physical surface. Only changed lines are re-emitted each frame, and the
 layout recomputes from the terminal size every frame.
 
-The cup is also a rigid body: real IMU tilt (M2+ MacBooks) slants the liquid,
+In the original --2d mode the cup is also a rigid body: real IMU tilt (M2+ MacBooks) slants the liquid,
 and past ~15 degrees it runs over the rim, streaks down the cup, stains the
 saucer, and pools on the floor against the terminal walls. Tip further (or
 shove hard) and the cup slides off the saucer, tumbles, bounces off the
@@ -19,6 +23,10 @@ Interactive keys while running:
   s      take a sip (refills with a pour animation when the cup runs low)
   space  stir the coffee
   x      nudge the cup (careful)
+  m      pour cream (APIC)
+  k      strongly knock the cup (APIC)
+  r      reset cup, spills and cream (APIC)
+  l      toggle cinematic lighting (Metal)
   w      steam writes the current time
   t      cycle themes
   q      quit (Ctrl+C also works)
@@ -45,7 +53,9 @@ User themes: ~/.config/caf/themes.toml, e.g.
   steam = [235, 230, 225]
   saucer = [140, 95, 60]
 
-Runs `caffeinate -d` for as long as it's on screen.
+Runs `caffeinate -d` for as long as it's on screen, and hands the session to
+caf-lid-guard so closing the lid doesn't sleep the machine out from under a
+long-running job (assertions alone can't stop lid-close sleep).
 """
 
 import base64
@@ -63,11 +73,20 @@ import threading
 import time
 import zlib
 
+from caf_motion import (SensorSamples, basis_for_rest, calibration_wizard,
+                        load_calibration)
+from caf_graphics import MetalRenderer, dimensions, probe_terminal, rgb_png
+
 # --------------------------------------------------------------------------
 # Themes
 # --------------------------------------------------------------------------
 
 THEMES = {
+    "diner": dict(
+        icon="☕", name="Diner / 94",
+        cup=(239, 225, 198), liquid=(65, 30, 17), crema=(185, 129, 65),
+        steam=(218, 219, 214), saucer=(224, 208, 182), sparkle=None,
+    ),
     "classic": dict(
         icon="☕", name="Classic",
         cup=(235, 155, 52), liquid=(88, 52, 26), crema=(206, 152, 92),
@@ -231,10 +250,16 @@ SAUCER_SEGS3D = [(a[0], a[1], b[0] - a[0], b[1] - a[1],
                   (b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
                  for a, b in zip(SAUCER3D, SAUCER3D[1:])]
 LIQ_R3D = 0.72
+RIM3D = 1.00                            # inner lip: the liquid stops here
+LIQ_SLOPE3D = 0.45                      # full tilt -> this much surface slope
 
 
-def sdf3d(x, y, z, liq_y):
-    """Signed distance to the scene. Returns (distance, material 0/1/2)."""
+def sdf3d(x, y, z, liq_y, pl=None):
+    """Signed distance to the scene. Returns (distance, material 0/1/2).
+
+    `pl` is the liquid surface plane (nx, ny, nz, c) from liquid_plane() when
+    the machine is tilted, or None for a level surface (the cheap path).
+    """
     q = math.sqrt(x * x + z * z)
     best = 1e9
     for ax, ay, dx, dy, dd in WALL_SEGS3D:
@@ -261,7 +286,15 @@ def sdf3d(x, y, z, liq_y):
         if d < best:
             best = d
     d_sau = math.sqrt(best) - 0.045
-    d_liq = y - liq_y                                # liquid: capped disc
+    if pl is None:
+        d_liq = y - liq_y                            # liquid: capped disc
+    else:
+        # tilted: the coffee stays level with real gravity while the cup
+        # leans with the laptop, capped at the rim so a hard lean brims
+        # instead of floating out over the wall
+        d_liq = x * pl[0] + y * pl[1] + z * pl[2] - pl[3]
+        if y - RIM3D > d_liq:
+            d_liq = y - RIM3D
     if q - LIQ_R3D > d_liq:
         d_liq = q - LIQ_R3D
     if 0.12 - y > d_liq:
@@ -273,7 +306,7 @@ def sdf3d(x, y, z, liq_y):
     return d_cup, 0
 
 
-def cam3d(yaw, pitch):
+def cam3d(yaw, pitch, roll=0.0):
     """Camera eye + orthonormal basis for the orbit camera."""
     tx, ty, tz = 0.0, 0.55, 0.0
     dist = 3.4
@@ -286,21 +319,50 @@ def cam3d(yaw, pitch):
     rl = math.sqrt(rx * rx + rz * rz)
     rx, rz = rx / rl, rz / rl
     ux, uy, uz = -rz * fy, rz * fx - rx * fz, rx * fy
-    return ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz
+    cr, sr = math.cos(roll), math.sin(roll)
+    rx, ry, rz, ux, uy, uz = (rx*cr + ux*sr, uy*sr, rz*cr + uz*sr,
+                             ux*cr - rx*sr, uy*cr, uz*cr - rz*sr)
+    return ex, ey, ez, fx, fy, fz, rx, ry, rz, ux, uy, uz
 
 
 def cam_angles(scene):
     return (scene.yaw + scene.yaw_kick,
-            max(0.10, min(0.98, scene.pitch + scene.pitch_kick)))
+            max(0.10, min(0.98, scene.pitch + scene.pitch_kick)),
+            scene.roll)
+
+
+def liquid_plane(scene, liq_y):
+    """The liquid surface under a tilted laptop, in cup space.
+
+    The terminal is bolted to the laptop and so is everything drawn in it, so
+    tilting the machine does not move the cup on screen — it moves *gravity*.
+    The surface therefore stays level with the real world while the cup leans
+    around it, which is what makes the coffee climb the near wall when you tip
+    the screen toward you. Screen axes are resolved through the orbit camera,
+    so the slant holds still on screen while the camera swings around it.
+
+    Returns (nx, ny, nz, c, sx, sz): the plane n.p == c, plus the downhill
+    slope the steam has to lean against. None when the machine is level.
+    """
+    tx, ty = scene.tilt_in
+    if not tx and not ty:
+        return None
+    yaw = cam_angles(scene)[0]
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    # screen right = (cy, -sy); screen "toward the viewer" = (sy, cy)
+    sx = (tx * cy + ty * sy) * LIQ_SLOPE3D
+    sz = (ty * cy - tx * sy) * LIQ_SLOPE3D
+    inv = 1.0 / math.sqrt(1.0 + sx * sx + sz * sz)
+    return (-sx * inv, inv, -sz * inv, liq_y * inv, sx, sz)
 
 
 def project3d(scene, wx, wy, wz):
     """World point -> (col, half-block row) under the current orbit camera."""
     W, Hpx = scene.W, scene.H
-    ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz = cam3d(*cam_angles(scene))
+    ex, ey, ez, fx, fy, fz, rx, ry, rz, ux, uy, uz = cam3d(*cam_angles(scene))
     wx, wy, wz = wx - ex, wy - ey, wz - ez
     zc = wx * fx + wy * fy + wz * fz
-    uc = (wx * rx + wz * rz) / zc * 1.9
+    uc = (wx * rx + wy * ry + wz * rz) / zc * 1.9
     vc = (wx * ux + wy * uy + wz * uz) / zc * 1.9
     aspect = W / Hpx
     return ((uc / (aspect * 0.95) + 1) / 2 * W,
@@ -310,12 +372,13 @@ def project3d(scene, wx, wy, wz):
 def render3d(scene):
     """Sphere-trace the scene into a px buffer (None = background)."""
     Wf, Hf = scene.W, scene.H
-    half = (Wf * Hf > 9000 and not scene.S) or Wf * Hf > 14000
+    half = Wf * Hf > (60000 if scene.S else 9000)
     W, Hpx = (Wf // 2, Hf // 2) if half else (Wf, Hf)
     th = scene._th
     cup_col, liq_col, crema, sauc_col = th["cup"], th["liquid"], th["crema"], th["saucer"]
     liq_y = 0.30 + 0.62 * scene.level
-    ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz = cam3d(*cam_angles(scene))
+    pl = liquid_plane(scene, liq_y)
+    ex, ey, ez, fx, fy, fz, rx, ry, rz, ux, uy, uz = cam3d(*cam_angles(scene))
     lx, ly, lz = -0.4082, 0.7715, -0.4876            # normalized key light
     ws = scene.water.sample
     aspect = W / Hpx
@@ -332,7 +395,7 @@ def render3d(scene):
         for i in range(W):
             u = ((i + 0.5) / W * 2 - 1) * aspect * 0.95
             dx = fx * 1.9 + rx * u + ux * v
-            dy = dyv
+            dy = dyv + ry * u
             dz = fz * 1.9 + rz * u + uz * v
             dl = math.sqrt(dx * dx + dy * dy + dz * dz)
             dx, dy, dz = dx / dl, dy / dl, dz / dl
@@ -348,7 +411,7 @@ def render3d(scene):
             mat = -1
             for _ in range(48):
                 pxx, pyy, pzz = ex + dx * t, ey + dy * t, ez + dz * t
-                d, m = sdf(pxx, pyy, pzz, liq_y)
+                d, m = sdf(pxx, pyy, pzz, liq_y, pl)
                 if d < 0.0035 + 0.0015 * t:
                     mat = m
                     break
@@ -359,9 +422,9 @@ def render3d(scene):
                 continue
             zb[j][i] = t
             e = 0.004
-            nx = sdf(pxx + e, pyy, pzz, liq_y)[0] - sdf(pxx - e, pyy, pzz, liq_y)[0]
-            ny = sdf(pxx, pyy + e, pzz, liq_y)[0] - sdf(pxx, pyy - e, pzz, liq_y)[0]
-            nz = sdf(pxx, pyy, pzz + e, liq_y)[0] - sdf(pxx, pyy, pzz - e, liq_y)[0]
+            nx = sdf(pxx + e, pyy, pzz, liq_y, pl)[0] - sdf(pxx - e, pyy, pzz, liq_y, pl)[0]
+            ny = sdf(pxx, pyy + e, pzz, liq_y, pl)[0] - sdf(pxx, pyy - e, pzz, liq_y, pl)[0]
+            nz = sdf(pxx, pyy, pzz + e, liq_y, pl)[0] - sdf(pxx, pyy, pzz - e, liq_y, pl)[0]
             nl = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
             nx, ny, nz = nx / nl, ny / nl, nz / nl
             if mat == 2:                              # bump-map from the water sim
@@ -381,7 +444,7 @@ def render3d(scene):
                 ts = 0.05
                 ox, oy, oz = pxx + nx * 0.008, pyy + ny * 0.008, pzz + nz * 0.008
                 for _ in range(20):
-                    dsh = sdf(ox + lx * ts, oy + ly * ts, oz + lz * ts, liq_y)[0]
+                    dsh = sdf(ox + lx * ts, oy + ly * ts, oz + lz * ts, liq_y, pl)[0]
                     if dsh < 0.0012:
                         sh = 0.0
                         break
@@ -412,7 +475,7 @@ def render3d(scene):
                 rpy = 0.0
                 hitr = False
                 for _ in range(16):
-                    dr, mr = sdf(ox + rdx * tr, oy + rdy * tr, oz + rdz * tr, liq_y)
+                    dr, mr = sdf(ox + rdx * tr, oy + rdy * tr, oz + rdz * tr, liq_y, pl)
                     if dr < 0.004:
                         hitr = mr != 2
                         rpy = oy + rdy * tr
@@ -426,6 +489,10 @@ def render3d(scene):
                     base = tuple(int(b + (c - b) * krf) for b, c in zip(base, rc))
             else:
                 base = cup_col if mat == 0 else sauc_col
+                if scene.theme_key == "diner":
+                    stripe = abs(pyy - .862) < .018 if mat == 0 else abs(math.hypot(pxx, pzz) - 1.14) < .02
+                    if stripe:
+                        base = (112, 31, 37)
                 k = 0.24 + 0.78 * diff
             row[i] = (min(255, int(base[0] * k + 200 * spec + 26 * fres)),
                       min(255, int(base[1] * k + 200 * spec + 26 * fres)),
@@ -451,6 +518,47 @@ IMU_PATH = "/tmp/caf-imu.dat"
 IMU_FMT = "<4sId8f"                   # magic, ver, t(f64), ax..gz, lux, checksum
 IMU_MAGIC = b"CIMU"
 
+# Orientation. The sensor is not chassis-aligned and the mounting is not
+# documented: an M-series MacBook sitting flat on a desk reads a ~20 degree
+# lean (a = (+0.05, -0.34, -0.92) g on the machine this was tuned on). Using
+# raw gravity components as tilt therefore bakes in a permanent slant — enough
+# to leave the coffee riding the spill threshold with nobody touching the
+# laptop. Tilt is measured against a calibrated rest pose instead, and the
+# horizontal axes are derived from it rather than picked by array index.
+DEG = math.pi / 180.0
+IMU_TAU = 0.45          # complementary filter: how fast accel corrects gyro
+IMU_DEAD = 0.030        # ~1.7 deg deadband — sensor noise, not a lean
+IMU_FULL = 0.38         # ~22 deg of lean = full-scale tilt
+IMU_SNAP = 0.25         # first-second calibration time constant
+IMU_LEVEL = 45.0        # optional --auto-level drift toward a new resting pose
+IMU_SMOOTH = 0.11       # output low-pass (seconds)
+
+
+def imu_axis_flips():
+    """CAF_IMU_FLIP: which way is 'right' and 'away' on this chassis.
+
+    The SPU publishes no axis convention, so the defaults below are the ones
+    that came out right on the machines this was tested on. Any mix of 'x'
+    (mirror left/right), 'y' (mirror near/far) and 's' (swap the two) fixes a
+    machine that leans the wrong way; `caf-art --imu-tilt` shows live values.
+    """
+    f = os.getenv("CAF_IMU_FLIP", "").lower()
+    return (-1.0 if "x" in f else 1.0, -1.0 if "y" in f else 1.0, "s" in f)
+
+
+def tilt_curve(ang):
+    """Lean angle (rad) -> sim tilt.
+
+    A deadband first, so noise and a slowly drifting reference never move the
+    coffee, then linear to full scale at IMU_FULL: the useful range is a wrist
+    tilt of the screen, not a 30-degree heave of the whole machine.
+    """
+    m = abs(ang)
+    if m < IMU_DEAD:
+        return 0.0
+    return math.copysign(min(1.0, (m - IMU_DEAD) / (IMU_FULL - IMU_DEAD)) * 0.95,
+                         ang)
+
 
 def imu_write_sample(fd, t, a, g, lux):
     chk = a[0] + a[1] + a[2] + g[0] + g[1] + g[2] + lux
@@ -464,10 +572,29 @@ def imu_read_sample():
         with open(IMU_PATH, "rb") as f:
             raw = f.read(struct.calcsize(IMU_FMT))
         magic, _ver, t, ax, ay, az, gx, gy, gz, lux, chk = struct.unpack(IMU_FMT, raw)
-        if magic != IMU_MAGIC or abs((ax + ay + az + gx + gy + gz + lux) - chk) > 1e-2:
+        if (magic != IMU_MAGIC or _ver != 2
+                or not all(math.isfinite(v) for v in (t, ax, ay, az, gx, gy, gz, lux, chk))
+                or abs((ax + ay + az + gx + gy + gz + lux) - chk) > 1e-2):
             return None
         return t, (ax, ay, az), (gx, gy, gz), lux
     except Exception:
+        return None
+
+
+def imu_start_bridge():
+    """Start the sensor bridge unless one is already streaming (M2+ only; it
+    exits harmlessly on machines without the sensor)."""
+    if sys.platform != "darwin":
+        return None
+    s = imu_read_sample()
+    if s and abs(time.monotonic() - s[0]) <= 0.6:
+        return None
+    try:
+        return subprocess.Popen([os.path.abspath(__file__), "--imu-bridge",
+                                 "--quiet"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    except OSError:
         return None
 
 
@@ -574,7 +701,7 @@ def imu_bridge(debug_secs=0, quiet=False):
               "layer (driver layer usually suffices; try sudo if no samples flow)")
 
     state = {"a": (0.0, 0.0, 0.0), "g": (0.0, 0.0, 0.0), "l": -1.0, "n": 0,
-             "lraw": b""}
+             "lraw": b"", "an": 0}
     CB = C.CFUNCTYPE(None, C.c_void_p, C.c_int32, C.c_void_p, C.c_uint32,
                      C.c_uint32, C.POINTER(C.c_ubyte), C.c_long, C.c_uint64)
 
@@ -600,6 +727,8 @@ def imu_bridge(debug_secs=0, quiet=False):
                 data = bytes(report[:int(length)])
                 x, y, z = struct.unpack_from("<iii", data, 6)
                 state[key] = (x / 65536.0, y / 65536.0, z / 65536.0)
+                if key == "a":
+                    state["an"] += 1
                 state["n"] += 1
         return CB(cb)
 
@@ -635,12 +764,15 @@ def imu_bridge(debug_secs=0, quiet=False):
               + (f" (debug {debug_secs}s)" if debug_secs else " — Ctrl+C to stop"))
     t_end = time.monotonic() + debug_secs if debug_secs else None
     last_dbg = 0.0
+    published = 0
     try:
         while t_end is None or time.monotonic() < t_end:
             cf.CFRunLoopRunInMode(
-                C.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode"), 0.03, False)
+                C.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode"), 0.008, False)
             now = time.monotonic()
-            imu_write_sample(fd, now, state["a"], state["g"], state["l"])
+            if state["an"] != published:
+                imu_write_sample(fd, now, state["a"], state["g"], state["l"])
+                published = state["an"]
             if debug_secs and now - last_dbg > 0.25:
                 last_dbg = now
                 a, g = state["a"], state["g"]
@@ -669,6 +801,7 @@ class SoundKit:
         self.dir = os.path.expanduser("~/.cache/caf/sounds")
         self.ok = sys.platform == "darwin" and shutil.which("afplay") is not None
         self._last = {}
+        self._voices = []
         if self.ok:
             try:
                 os.makedirs(self.dir, exist_ok=True)
@@ -679,6 +812,9 @@ class SoundKit:
     def play(self, name, vol=0.5):
         if not self.ok:
             return
+        self._voices = [p for p in self._voices if p.poll() is None]
+        if len(self._voices) >= 3:
+            return
         now = time.monotonic()
         if now - self._last.get(name, 0.0) < 0.18:
             return
@@ -686,11 +822,21 @@ class SoundKit:
         path = os.path.join(self.dir, name + ".wav")
         if os.path.exists(path):
             try:
-                subprocess.Popen(["afplay", "-v", f"{vol:.2f}", path],
+                self._voices.append(subprocess.Popen(["afplay", "-v", f"{vol:.2f}", path],
                                  stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
+                                 stderr=subprocess.DEVNULL))
             except OSError:
                 self.ok = False
+
+    def close(self):
+        for proc in self._voices:
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=.5)
+            except subprocess.TimeoutExpired:
+                proc.kill(); proc.wait()
+        self._voices.clear()
 
     def _write(self, name, samples):
         import wave
@@ -716,6 +862,22 @@ class SoundKit:
                 for f, A, d in ((2350, 0.5, 0.03), (3170, 0.35, 0.022),
                                 (5230, 0.2, 0.014)))
             * min(1.0, i / (R * 0.002)) for i in range(n)])
+
+        # Impact-driven body foley: a lower ceramic knock, not breaking glass.
+        n = int(R * .30)
+        self._write("ceramic", [sum(a*math.sin(2*math.pi*f*i/R)*math.exp(-i/(R*d))
+            for f,a,d in ((730,.45,.06),(1470,.3,.045),(2430,.18,.025)))
+            for i in range(n)])
+        # Broadband water splat with small resonant drops; only actual contacts
+        # trigger this clip. Playback has a shared three-voice upper bound.
+        n = int(R*.32)
+        out = []; low = 0.
+        for i in range(n):
+            low += (rnd.uniform(-1,1)-low)*.32
+            envelope = (1-math.exp(-i/(R*.003)))*math.exp(-i/(R*.075))
+            drops = math.sin(2*math.pi*(480+900*i/n)*i/R)*.15
+            out.append((low*.75+drops)*envelope)
+        self._write("splash", out)
 
         # drip: a short blip sliding up in pitch
         n = int(R * 0.12)
@@ -762,6 +924,63 @@ class SoundKit:
                     + 0.22 * math.sin(2 * math.pi * 2710 * i / R) * math.exp(-i / (R * 0.05)))
             out.append(lp * 0.8 * math.exp(-i / (R * 0.06)) + ring)
         self._write("crash", out)
+
+
+def tilt_bar(v, w=10):
+    cells = ["\u00b7"] * (2 * w + 1)
+    cells[w] = "|"
+    n = max(-w, min(w, int(round(v * w))))
+    for i in range(min(0, n), max(0, n) + 1):
+        cells[w + i] = "\u2588"
+    return "".join(cells)
+
+
+def imu_tilt_debug(secs=30):
+    """Live tilt readout — the tool for checking CAF_IMU_FLIP.
+
+    Tilt the laptop and watch: `right` should fill rightwards as the right
+    side of the machine goes down, `away` as the far edge goes down. If either
+    runs backwards, or the two are crossed, set CAF_IMU_FLIP.
+    """
+    proc = imu_start_bridge()
+    scene = Scene("classic")
+    flip = os.getenv("CAF_IMU_FLIP", "") or "none"
+    print("caf imu: tilt the laptop \u2014 right side down fills 'right', far "
+          "edge down fills 'away'.")
+    print(f"         crossed or backwards? set CAF_IMU_FLIP to any of x y s "
+          f"(now: {flip}).  Ctrl+C to stop.")
+    t_end = time.monotonic() + secs
+    prev = None
+    live = True
+    try:
+        while time.monotonic() < t_end:
+            now = time.monotonic()
+            smp = imu_read_sample()
+            if not smp or abs(now - smp[0]) > 0.6:
+                if live:
+                    live = False
+                    sys.stdout.write("\rwaiting for the sensor bridge\u2026"
+                                     + " " * 40)
+                    sys.stdout.flush()
+                time.sleep(0.2)
+                continue
+            live = True
+            if smp[0] != prev:
+                scene.imu_input(smp[1], smp[2], smp[0] - (prev or smp[0] - 0.06))
+                prev = smp[0]
+            tx, ty = scene.tilt_in
+            a = smp[1]
+            sys.stdout.write(f"\r right {tilt_bar(tx)}  away {tilt_bar(ty)}"
+                             f"   raw a=({a[0]:+.2f},{a[1]:+.2f},{a[2]:+.2f})g ")
+            sys.stdout.flush()
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if proc:
+            proc.terminate()
+    print()
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -847,6 +1066,14 @@ class Scene:
         self.sparkles = []
         self.precip = []                # [x, y, vx, vy] rain/snow
         self.t = 0.0
+        self.real_fluid = False
+        self.cup_motion = True
+        self.cinematic = True
+        self._physics_audio = {}
+        self.fluid_events = []
+        self.fluid_stats = {}
+        self.gravity = (0., -1., 0.)
+        self.fluid_accel = (0., 0., 0.)
         self.level = 1.0
         self.target_level = 1.0
         self.sips = 0
@@ -859,13 +1086,24 @@ class Scene:
         self.word = None                # dict(pairs=[(particle, tx, ty)], until=t)
         self.mode3d = False
         self.yaw = 0.6
-        self.pitch = 0.38
-        self.auto_orbit = True
+        self.pitch = 0.48
+        self.auto_orbit = False       # quiet diorama; o enables the old orbit
         self.z_push = 0.0               # 2.5D: >0 pushes steam toward the viewer
         self.updraft = 0.0
-        self._imu_grav = None
-        self._imu_down = None
+        self._imu_up = None             # filtered up vector (sensor frame)
+        self._imu_rest = None           # calibrated level reference
+        self._imu_basis = None          # (right, away, up) unit vectors
+        self._imu_age = 0.0
+        self._imu_still = 0.0
+        self._imu_flip = imu_axis_flips()
+        self._gyro_sign = 1.0           # learned handedness of the gyro
+        self._gyro_score = 0.0
+        self._imu_prev_a = None
         self.yaw_kick = 0.0             # 3d camera parallax from window motion
+        self.roll = 0.0
+        self.auto_level = False
+        self._calibration = load_calibration()
+        self._water_clock = 0.0
         self.pitch_kick = 0.0
         self.tilt_in = (0.0, 0.0)       # raw IMU tilt (cup rotation adds to it)
         # --- cup rigid body: the cup can rock, spill, slide, and fall ---
@@ -900,11 +1138,51 @@ class Scene:
         self.water.disturb(0.0, 0.75, -0.55, 0.2)
         if self.snd:
             self.snd("slurp", 0.5)
-        if not pomo:
+        if self.real_fluid:
+            self.fluid_events.append({"kind": "refill" if self.level <= .3 and not pomo else "sip"})
+        elif not pomo:
             if self.target_level <= 0.3:
                 self.target_level = 1.0
             else:
                 self.target_level = max(0.18, self.target_level - 0.27)
+
+    def refill(self):
+        if self.real_fluid:
+            self.fluid_events.append({"kind": "refill"})
+        else:
+            self.target_level = 1.0
+
+    def add_cream(self):
+        if self.real_fluid:
+            self.fluid_events.append({"kind": "cream"})
+
+    def knock_over(self):
+        if self.real_fluid and self.cup_motion:
+            self.fluid_events.append({"kind": "knock"})
+        elif not self.mode3d:
+            self.nudge(2.0)
+
+    def fluid_feedback(self, stats):
+        """Foley follows measured contact events, never random timers."""
+        if not self.snd:
+            return
+        now = stats.get("simulated_time", 0.)
+        if any(t > now for t in self._physics_audio.values()):
+            self._physics_audio.clear()  # explicit scene reset
+        impact = stats.get("cup_impact", 0.)
+        splash = stats.get("splash_impact", 0.)
+        for name, strength, threshold, cooldown in (("ceramic", impact, .3, .24),
+                                                     ("splash", splash, 12., .38)):
+            if strength > threshold and now-self._physics_audio.get(name, -99.) >= cooldown:
+                volume = min(.65, .1+math.sqrt(strength)*(.16 if name=="ceramic" else .006))
+                self.snd(name, volume)
+                self._physics_audio[name] = now
+
+    def reset_fluid(self):
+        if self.real_fluid:
+            self.fluid_events = [{"kind": "reset"}]
+        else:
+            self.target_level = 1.0
 
     def stir(self):
         self.stir_t = self.t
@@ -917,6 +1195,14 @@ class Scene:
     def nudge(self, k=1.0):
         """Physically poke the cup (x key / hard window shoves)."""
         if self.mode3d:
+            if self.real_fluid:
+                self.fluid_events.append({"kind": "poke"})
+            # APIC receives a physical cup impulse; the legacy renderer
+            # retains its original wave-only poke.
+            self.water.disturb(random.uniform(-0.7, 0.7),
+                               random.uniform(-0.7, 0.7), 0.45 * k, 0.2)
+            if self.snd and not self.real_fluid:
+                self.snd("clink", 0.35)
             return
         kick = random.uniform(1.6, 2.6) * k * random.choice((-1.0, 1.0))
         self.cup_av += kick
@@ -929,39 +1215,180 @@ class Scene:
         target = max(0.30, min(1.0, 0.30 + 0.70 * math.log10(1 + lux) / 2.0))
         self.ambient += (target - self.ambient) * min(1.0, dt * 1.5)
 
+    def imu_level(self):
+        """Re-zero the tilt: whatever pose the laptop is in now reads level."""
+        self.gravity = (0., -1., 0.)
+        self.fluid_accel = (0., 0., 0.)
+        if self._imu_up is not None:
+            self._imu_rest = list(self._imu_up)
+            self._imu_age = 0.0
+            self._imu_still = 0.0
+            self.tilt_in = (0.0, 0.0)
+            self.roll = 0.0
+
+    def resume_imu(self, acceleration):
+        """Reacquire orientation after idle without changing calibrated level."""
+        mag = math.sqrt(sum(v*v for v in acceleration))
+        if .85 < mag < 1.15 and self._imu_up is not None:
+            self._imu_up = [v/mag for v in acceleration]
+        self._imu_prev_a = None
+        self.fluid_accel = (0., 0., 0.)
+
+    def _imu_orient(self, a, g, dt):
+        """Track which way is up, in sensor axes, and what 'level' means.
+
+        A complementary filter: the gyro turns the up vector every sample
+        (fast, but it drifts) and the accelerometer pulls it back over
+        IMU_TAU (slow, but absolute). The plain accel low-pass this replaced
+        had to choose between lagging the laptop by half a second and
+        mistaking a shove for a tilt — this does neither, which is the whole
+        difference between the coffee following the screen and the coffee
+        catching up with it.
+
+        Returns the (right, near, up) basis, or None until it has a fix.
+        """
+        self._imu_age += dt
+        mag = math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+        if mag < 0.25:                  # free fall, or a sensor hiccup
+            return self._imu_basis
+        an = [c / mag for c in a]       # an points *up*: at rest an
+                                        # accelerometer reads the reaction
+                                        # force, not gravity
+        if self._imu_up is None:
+            self._imu_up = list(an)
+            self._imu_rest = list(an)
+        up = self._imu_up
+        wx, wy, wz = (v * DEG * self._gyro_sign for v in g)
+        x0, y0, z0 = up
+        # a world-fixed vector turns the other way in the body frame: -w x up
+        px = x0 - (wy * z0 - wz * y0) * dt
+        py = y0 - (wz * x0 - wx * z0) * dt
+        pz = z0 - (wx * y0 - wy * x0) * dt
+        # the gyro's handedness is undocumented, so learn it: whichever sign
+        # predicts the motion the accelerometer then measures is the right one
+        pa = self._imu_prev_a
+        if pa is not None and abs(mag - 1.0) < 0.15 and abs(wx) + abs(wy) + abs(wz) > 0.25:
+            self._gyro_score += ((px - x0) * (an[0] - pa[0])
+                                 + (py - y0) * (an[1] - pa[1])
+                                 + (pz - z0) * (an[2] - pa[2]))
+            if self._gyro_score < -0.02:
+                self._gyro_sign = -self._gyro_sign
+                self._gyro_score = 0.0
+            elif self._gyro_score > 0.02:
+                self._gyro_score = 0.02
+        self._imu_prev_a = an
+        # accel correction, faded out while the reading is not ~1g: a shove
+        # is not gravity, and letting one masquerade as gravity is what makes
+        # a sloshed cup slowly tip over
+        k = min(1.0, dt / IMU_TAU) * max(0.0, 1.0 - abs(mag - 1.0) * 3.0)
+        up[0] = px + (an[0] - px) * k
+        up[1] = py + (an[1] - py) * k
+        up[2] = pz + (an[2] - pz) * k
+        n = math.sqrt(up[0] ** 2 + up[1] ** 2 + up[2] ** 2) or 1.0
+        up[0] /= n
+        up[1] /= n
+        up[2] /= n
+        # Settle the reference for the first second, then lock it: a held
+        # side tilt must not disappear. --auto-level restores the old slow
+        # drift toward a new resting pose; z explicitly resets either mode.
+        rest = self._imu_rest
+        still = abs(mag - 1.0) < 0.04 and abs(wx) + abs(wy) + abs(wz) < 0.5
+        self._imu_still = max(0.0, self._imu_still + (dt if still else -dt * 4))
+        young = self._imu_age < 1.2
+        if young or (self.auto_level and self._imu_still > 3.0):
+            kr = min(1.0, dt / (IMU_SNAP if young else IMU_LEVEL))
+            for i in range(3):
+                rest[i] += (up[i] - rest[i]) * kr
+            n = math.sqrt(rest[0] ** 2 + rest[1] ** 2 + rest[2] ** 2) or 1.0
+            rest[0] /= n
+            rest[1] /= n
+            rest[2] /= n
+            # screen right: the sensor axis that survives being projected out
+            # of vertical — whichever one the rest pose leans on least
+            m0, m1, m2 = abs(rest[0]), abs(rest[1]), abs(rest[2])
+            ax = 0 if m0 <= m1 and m0 <= m2 else (1 if m1 <= m2 else 2)
+            r = [-rest[ax] * rest[i] for i in range(3)]
+            r[ax] += 1.0
+            n = math.sqrt(r[0] ** 2 + r[1] ** 2 + r[2] ** 2) or 1.0
+            r = [v / n for v in r]
+            # the other screen axis points at you, matching the water sim's
+            # near/far convention (positive tilt pools the coffee at the near
+            # rim, which is the one it spills over)
+            f = [r[1] * rest[2] - r[2] * rest[1],
+                 r[2] * rest[0] - r[0] * rest[2],
+                 r[0] * rest[1] - r[1] * rest[0]]
+            self._imu_basis = (r, f, list(rest))
+            if self._calibration:
+                try:
+                    self._imu_basis = basis_for_rest(self._calibration, rest)
+                except ValueError:
+                    pass  # an extreme pose cannot define a horizontal screen axis
+        return self._imu_basis
+
     def imu_input(self, a, g, dt):
-        """Real laptop motion from the SPU IMU (a in g, gyro in deg/s)."""
-        if self._imu_grav is None:
-            self._imu_grav = list(a)
-        gr = self._imu_grav
-        k = min(1.0, dt * 2.0)          # low-pass -> gravity estimate
-        for i in range(3):
-            gr[i] += (a[i] - gr[i]) * k
-        lin = [a[i] - gr[i] for i in range(3)]
-        if self._imu_down is None:
-            mags = [abs(v) for v in gr]
-            self._imu_down = mags.index(max(mags))   # axis holding ~1g at rest
-        d = self._imu_down
-        h1, h2 = [i for i in range(3) if i != d]     # horizontal axes
-        # tilt: gravity leaking into the horizontal axes slants the coffee
-        tx = max(-0.5, min(0.5, gr[h1] * (1 if gr[d] > 0 else -1)))
-        ty = max(-0.5, min(0.5, gr[h2] * (1 if gr[d] > 0 else -1)))
-        self.tilt_in = (tx * 1.6, ty * 1.6)
-        self.wind += tx * 9 * dt                     # steam leans with tilt
-        # linear shoves: slosh + 2.5D depth push + updraft
-        mag = math.hypot(lin[h1], lin[h2])
-        if mag > 0.12:
-            self.water.disturb(max(-0.8, min(0.8, -lin[h1] * 4)),
-                               max(-0.8, min(0.8, -lin[h2] * 4)),
-                               min(0.5, mag * 1.6), 0.15)
-        if mag > 0.30 and not self.mode3d:            # hard jolts rock the cup
-            self.cup_av += max(-1.6, min(1.6, lin[h1] * 4.5))
-        self.z_push = max(-1.5, min(1.5, self.z_push + lin[h2] * 2.2))
-        self.updraft = max(-8.0, min(8.0, self.updraft - lin[d] * 10))
+        """Real laptop motion from the SPU IMU (a in g, gyro in deg/s).
+
+        Tilt is the rotation away from the calibrated rest pose, resolved
+        onto screen axes: drop the right side of the machine and the coffee
+        runs right, tip the screen toward you and it runs toward you.
+        """
+        dt = max(1e-3, min(0.25, dt))
+        basis = self._imu_orient(a, g, dt)
+        if basis is None:
+            return
+        r, f, u = basis            # screen right, screen near, vertical
+        up = self._imu_up
+        mx, my, swap = self._imu_flip   # chassis convention (CAF_IMU_FLIP)
+        # how far vertical has swung off the rest pose, along each screen axis
+        ur = up[0] * r[0] + up[1] * r[1] + up[2] * r[2]
+        uf = up[0] * f[0] + up[1] * f[1] + up[2] * f[2]
+        if swap:
+            ur, uf = uf, ur
+        self.gravity = (-ur * mx, -sum(up[i] * u[i] for i in range(3)), -uf * my)
+        # vertical leaning right means the *left* side is down, hence the sign
+        tx = tilt_curve(-math.asin(max(-1.0, min(1.0, ur))) * mx)
+        ty = tilt_curve(-math.asin(max(-1.0, min(1.0, uf))) * my)
+        k = min(1.0, dt / IMU_SMOOTH)
+        self.tilt_in = (self.tilt_in[0] + (tx - self.tilt_in[0]) * k,
+                        self.tilt_in[1] + (ty - self.tilt_in[1]) * k)
+        self.roll += (self.tilt_in[0] * .09 - self.roll) * k
+        self.wind += self.tilt_in[0] * 9 * dt        # steam leans with tilt
+        # linear shoves: slosh + 2.5D depth push + updraft. The gravity
+        # estimate is a unit vector = 1 g, so subtracting it leaves the part
+        # of the reading that is actually you moving the machine.
+        lin = [a[i] - up[i] for i in range(3)]
+        lr = (lin[0] * r[0] + lin[1] * r[1] + lin[2] * r[2])
+        lf = (lin[0] * f[0] + lin[1] * f[1] + lin[2] * f[2])
+        ld = lin[0] * u[0] + lin[1] * u[1] + lin[2] * u[2]
+        if swap:
+            lr, lf = lf, lr
+        lr *= mx
+        lf *= my
+        self.fluid_accel = tuple(max(-40., min(40., v * 20.)) for v in (lr, ld, lf))
+        mag = math.hypot(lr, lf)
+        impulse_scale = min(2., dt / .066)
+        if mag > 0.10:
+            self.water.disturb(max(-0.8, min(0.8, -lr * 4)),
+                               max(-0.8, min(0.8, -lf * 4)),
+                               min(0.5, mag * 1.8) * impulse_scale, 0.15)
+        if mag > 0.30:                               # hard jolts
+            if self.mode3d:
+                # no rigid body in 3d, so the whole jolt lands in the coffee
+                self.water.disturb(max(-0.8, min(0.8, -lr * 5)),
+                                   max(-0.8, min(0.8, -lf * 5)),
+                                   min(0.6, mag) * impulse_scale, 0.22)
+            else:
+                self.cup_av += max(-1.6, min(1.6, lr * 4.5)) * impulse_scale
+        # pull the machine toward you and the steam is left behind
+        self.z_push = max(-1.5, min(1.5, self.z_push - lf * 2.2 * impulse_scale))
+        self.updraft = max(-8.0, min(8.0, self.updraft - ld * 10 * impulse_scale))
         if self.mode3d:                              # gyro steers the camera
-            self.yaw_kick = max(-0.6, min(0.6, self.yaw_kick + g[d] * 0.0022))
+            sg = self._gyro_sign
+            wu = (g[0] * u[0] + g[1] * u[1] + g[2] * u[2]) * sg    # spin
+            wr = (g[0] * r[0] + g[1] * r[1] + g[2] * r[2]) * sg    # pitch
+            self.yaw_kick = max(-0.6, min(0.6, self.yaw_kick + wu * dt * 0.033))
             self.pitch_kick = max(-0.25, min(0.25,
-                                             self.pitch_kick + g[h1] * 0.0009))
+                                             self.pitch_kick + wr * dt * 0.0135))
 
     def window_motion(self, vx, vy):
         """React to the terminal window being dragged (vx/vy in px/s).
@@ -971,6 +1398,8 @@ class Scene:
         shrinks the wisps. Hard shoves slosh the coffee by inertia and, in 3D,
         nudge the camera for parallax.
         """
+        if self.real_fluid:
+            self.fluid_accel = (max(-30., min(30., vx * .01)), 0., max(-30., min(30., vy * .01)))
         self.wind = max(-8.0, min(8.0, self.wind - vx * 0.006))
         self.updraft = max(-8.0, min(8.0, self.updraft + vy * 0.005))
         self.z_push = max(-1.5, min(1.5, self.z_push + vy * 0.0012))
@@ -1052,8 +1481,8 @@ class Scene:
     def _anchor3d(self):
         """Derive the 2D steam/word anchors from the projected 3D rim."""
         ci, cj = project3d(self, 0.0, 1.0, 0.0)
-        _, _, _, _, _, _, rx, rz, _, _, _ = cam3d(*cam_angles(self))
-        ri, _ = project3d(self, 0.8 * rx, 1.0, 0.8 * rz)
+        _, _, _, _, _, _, rx, ry, rz, _, _, _ = cam3d(*cam_angles(self))
+        ri, _ = project3d(self, 0.8 * rx, 1.0 + 0.8 * ry, 0.8 * rz)
         half_w = max(4.0, abs(ri - ci))
         self.cx = int(ci)
         self.cup_w = int(half_w * 2)
@@ -1291,11 +1720,14 @@ class Scene:
         if t - self._heat_at > 1.0:
             self._heat_at = t
             self._sample_heat()
-        pouring = self.target_level - self.level > 0.04
+        pouring = ((self.fluid_stats.get("pour_remaining", 0)+self.fluid_stats.get("cream_remaining", 0)) > 0 if self.real_fluid
+                   else self.target_level - self.level > 0.04)
         if pouring and not getattr(self, "_was_pouring", False) and self.snd:
             self.snd("glug", 0.55)
         self._was_pouring = pouring
-        self.level += (self.target_level - self.level) * min(1.0, dt * (1.2 if pouring else 2.5))
+        if not self.real_fluid:
+            self.level += (self.target_level - self.level) * min(1.0, dt * (1.2 if pouring else 2.5))
+        self.fluid_accel = tuple(v * math.exp(-dt*12) for v in self.fluid_accel)
         self.wind *= math.exp(-dt * 1.2)
         decay = math.exp(-dt * 1.6)
         self.updraft *= decay
@@ -1309,22 +1741,33 @@ class Scene:
             if self.drops or any(v > 0.01 for v in self.puddle):
                 self._drops_step(dt)
 
-        # --- water surface ---
-        w = self.water
-        w.tilt = (self.tilt_in[0] + (0.0 if self.mode3d else self.cup_ang * 2.0),
-                  self.tilt_in[1])
-        w.step()
-        if random.random() < 0.25 + self.heat * 0.5:            # thermal jitter
-            w.disturb(random.uniform(-0.7, 0.7), random.uniform(-0.7, 0.7),
-                      random.uniform(0.008, 0.02 + 0.08 * self.heat), 0.08)
-        if self.heat > 0.45 and random.random() < (self.heat - 0.4) * 0.9:
-            w.disturb(random.uniform(-0.5, 0.5), random.uniform(-0.5, 0.5), 0.3, 0.06)  # boil bubble
-        stir_age = t - self.stir_t
-        if 0 <= stir_age < 1.3:                                  # orbiting spoon
-            ang = stir_age * 9.0
-            w.disturb(math.cos(ang) * 0.55, math.sin(ang) * 0.55, 0.35, 0.1)
-        if pouring:
-            w.disturb(-0.15, -0.2, random.uniform(0.15, 0.4), 0.09)
+        # Legacy heightfield is not a second force source for APIC.
+        if not self.real_fluid:
+            # --- water surface ---
+            w = self.water
+            if self.mode3d:
+                # the surface plane already sits at the real slope (liquid_plane),
+                # so the height field only carries enough tilt to slosh toward the
+                # low side — any more and the bump map double-counts the lean
+                w.tilt = (self.tilt_in[0] * 0.35, self.tilt_in[1] * 0.35)
+            else:
+                w.tilt = (self.tilt_in[0] + self.cup_ang * 2.0, self.tilt_in[1])
+            self._water_clock += dt
+            while self._water_clock >= 1/15:
+                w.step()
+                self._water_clock -= 1/15
+            if random.random() < (0.25 + self.heat * 0.5) * min(1., dt*15):            # thermal jitter
+                w.disturb(random.uniform(-0.7, 0.7), random.uniform(-0.7, 0.7),
+                          random.uniform(0.008, 0.02 + 0.08 * self.heat), 0.08)
+            if self.heat > 0.45 and random.random() < (self.heat - 0.4) * 0.9 * min(1., dt*15):
+                w.disturb(random.uniform(-0.5, 0.5), random.uniform(-0.5, 0.5), 0.3, 0.06)  # boil bubble
+            stir_age = t - self.stir_t
+            if 0 <= stir_age < 1.3:                                  # orbiting spoon
+                ang = stir_age * 9.0
+                w.disturb(math.cos(ang) * 0.55, math.sin(ang) * 0.55, 0.35, 0.1)
+            if pouring:
+                w.disturb(-0.15, -0.2, random.uniform(0.15, 0.4), 0.09)
+
 
         # --- steam particles ---
         heat_k = 0.5 + 0.9 * self.heat
@@ -1344,11 +1787,13 @@ class Scene:
         if self.mode3d:
             # world-space wisps rising off the liquid surface
             liq_y = 0.30 + 0.62 * self.level
+            pl = liquid_plane(self, liq_y)
+            lean_x, lean_z = (-pl[4], -pl[5]) if pl else (0.0, 0.0)
             rate = int((2 + self.heat * 4) * (0.4 + 0.6 * self.level))
             if self.level < 0.05:
                 rate = 0
             for _ in range(rate):
-                if random.random() < 0.6:
+                if random.random() < 0.6 * min(1., dt*15):
                     r = math.sqrt(random.random()) * 0.5
                     aa = random.uniform(0, math.tau)
                     self.particles.append([r * math.cos(aa), liq_y + 0.02,
@@ -1361,9 +1806,10 @@ class Scene:
                 n3 = vnoise(p[2] * 1.6, p[1] * 1.6 + t * 0.25) - 0.5
                 rise = ((0.30 + 0.18 * self.heat + self.updraft * 0.05)
                         * (1 + 0.25 * math.sin(p[3] + p[1] * 2.2)))
-                p[0] += (n1 * 0.38 + self.wind * 0.045) * dt
+                # rise is along real vertical, not the cup's axis
+                p[0] += (n1 * 0.38 + self.wind * 0.045 + lean_x * rise) * dt
                 p[1] += rise * dt
-                p[2] += n3 * 0.55 * dt
+                p[2] += (n3 * 0.55 + lean_z * rise) * dt
                 p[4] += dt
                 if p[4] < p[5] and p[1] < 2.8:
                     alive.append(p)
@@ -1691,7 +2137,7 @@ class Scene:
         W, H = self.W, self.H
         sc = self._th["steam"]
         zb, zw, zh = self._zb
-        ex, ey, ez, fx, fy, fz, rx, rz, ux, uy, uz = cam3d(*cam_angles(self))
+        ex, ey, ez, fx, fy, fz, rx, ry, rz, ux, uy, uz = cam3d(*cam_angles(self))
         lx, lz = -0.4082, -0.4876
         aspect = W / H
         bw = W * 2
@@ -1703,7 +2149,7 @@ class Scene:
             zc = cxp * fx + cyp * fy + czp * fz
             if zc < 0.4:
                 continue
-            uc = (cxp * rx + czp * rz) / zc * 1.9
+            uc = (cxp * rx + cyp * ry + czp * rz) / zc * 1.9
             vc = (cxp * ux + cyp * uy + czp * uz) / zc * 1.9
             i = (uc / (aspect * 0.95) + 1) / 2 * W
             j = (1 - (vc + 0.28) / 0.95) / 2 * H
@@ -1896,11 +2342,24 @@ class Scene:
                          "fallen": " · 🫗 spilled"}[self.cup_state]
         else:
             extra_cup = f" · 🫗 {self.spills}" if self.spills else ""
+        if self.real_fluid:
+            st = self.fluid_stats
+            spilled = sum(st.get(k, 0) for k in ("on_saucer", "on_table", "airborne", "off_scene"))
+            extra_cup = f" · {round(self.level*100)}%"
+            if spilled:
+                extra_cup += f" · spilled {round(100*spilled/max(1, st.get('initial', 0)+st.get('emitted', 0)))}%"
+            if st.get("cream_remaining", 0):
+                extra_cup += " · cream"
+            if st.get("cup_tilt", 0) > 55:
+                extra_cup += " · tipped [r]"
+            if st.get("capacity_limited"):
+                extra_cup += " · [r] reset to refill"
         extra = extra_cup + extra
         if not interactive:
             keys = " · Ctrl+C to stop"
         elif self.mode3d:
-            keys = " · [s]ip [␣]stir [←→↑↓/o]rbit [w]rite [t]heme [q]uit"
+            keys = (" · [s]ip [f]ill [r]eset [m]ilk [k]nock [l]ight [␣]stir [x]nudge "
+                    "[←→↑↓/o]rbit [w]rite [t]heme [q]uit")
         else:
             keys = " · [s]ip [␣]stir [x]nudge [w]rite [t]heme [q]uit"
         text = f" {th['icon']}  {th['name']} · awake {clock} · cup {cup_bar} · heat {heat_bar}{extra}{keys} "
@@ -1976,17 +2435,34 @@ def fetch_weather(scene):
 # --------------------------------------------------------------------------
 
 def usage():
-    print("\x1b[1mUsage:\x1b[0m caf [preset] [--3d] [--pomodoro N] [--weather] [--zen] [--hires] [--sound]")
+    print("\x1b[1mUsage:\x1b[0m caf [preset] [--2d] [--pomodoro N] [--weather] [--zen] [--hires] [--sound]")
     print("\x1b[1mPresets:\x1b[0m " + ", ".join(THEMES) + "  (aliases: " + ", ".join(ALIASES) + ")")
     print("\x1b[1mKeys:\x1b[0m s = sip, space = stir, x = nudge the cup, w = write the time,")
-    print("      t = theme, q = quit; --3d adds arrows = orbit, o = auto-orbit")
+    print("      t = theme, z = call the current laptop pose level, q = quit;")
+    print("      arrows = orbit, o = auto-orbit (3d; off by default)")
+    print("      --calibrate: guided left/right and forward/back calibration (saved)")
+    print("      --auto-level: let a held pose slowly become level (default: locked)")
+    print("      --renderer auto|metal|cpu: optional Metal graphics, safe CPU fallback")
+    print("      m pours cream, k knocks the cup over, l toggles cinematic lighting")
+    print("      --cup free|locked: mobile cup (default) or fixed; --studio: static lighting")
+    print("      --fluid apic|legacy: real GPU spills (default) or old surface; f refills, r resets")
+    print("      --ansi: force character output; --smooth: disable fine GPU dithering")
+    print("\x1b[1mMode:\x1b[0m the ray-marched cup is the default; --2d gives the half-block")
+    print("     scene, which is cheaper and retains its original rigid-body physics.")
     print("\x1b[1mThemes file:\x1b[0m ~/.config/caf/themes.toml")
-    print("\x1b[1mIMU:\x1b[0m auto-detected on M2+ MacBooks — real tilt slants the coffee (tip far")
-    print("     enough and it spills; the cup can slide off the saucer and hit the floor),")
+    print("\x1b[1mIMU:\x1b[0m auto-detected on M2+ MacBooks — tilting the laptop tilts real")
+    print("     gravity: the coffee stays level while the cup leans with the machine,")
     print("     shoves slosh it, spinning steers the 3D camera, and the ambient light")
-    print("     sensor dims the scene with your room. caf-art --imu-debug [secs] shows")
-    print("     live samples; caf-art --imu-bridge runs the sensor bridge manually.")
+    print("     sensor dims the scene with your room. The pose caf starts in is level;")
+    print("     z re-zeros it; a held lean stays tilted unless --auto-level is set.")
+    print("     caf --calibrate saves explicit screen axes. --imu-tilt shows both axes (set")
+    print("     CAF_IMU_FLIP=x, y or s if your machine leans the wrong way);")
+    print("     --imu-debug [secs] shows raw samples, --imu-bridge runs the bridge.")
     print("\x1b[1mSound:\x1b[0m --sound adds procedural foley (clink/glug/slurp/crash) via afplay.")
+    print("\x1b[1mLid:\x1b[0m closing the lid normally sleeps the Mac no matter how many power")
+    print("     assertions caffeinate holds, so caf also runs caf-lid-guard (one sudo")
+    print("     prompt, pmset disablesleep, cleared the instant caf exits). Skip it with")
+    print("     --no-lid-guard; inspect it with caf-lid-guard status.")
 
 
 def main():
@@ -1995,12 +2471,20 @@ def main():
     demo_frames = 0
     demo_size = None
     no_caf = False
-    preset = "classic"
+    no_lid_guard = False
+    preset = "diner"
+    renderer_mode = "auto"
+    fluid_mode = "apic"
+    cup_motion = True
+    cinematic = True
+    ansi = False
+    auto_level = False
+    dither = True
     pomo_min = 0
     zen = False
     hires = False
     weather = False
-    three_d = False
+    three_d = True
     sound = False
     i = 0
     while i < len(args):
@@ -2013,16 +2497,45 @@ def main():
             w, h = args[i + 1].split("x"); demo_size = (int(w), int(h)); i += 1
         elif a == "--no-caffeinate":
             no_caf = True
+        elif a == "--no-lid-guard":
+            no_lid_guard = True
         elif a in ("--pomodoro", "pomo"):
             pomo_min = int(args[i + 1]); i += 1
         elif a == "--zen":
             zen = True
         elif a == "--hires":
             hires = True
+        elif a == "--ansi":
+            ansi = True
+        elif a == "--renderer":
+            if i+1 >= len(args) or args[i+1] not in ("auto", "metal", "cpu"):
+                print("caf: --renderer expects auto, metal, or cpu", file=sys.stderr)
+                return 2
+            renderer_mode = args[i+1]; i += 1
+        elif a == "--fluid":
+            if i+1 >= len(args) or args[i+1] not in ("apic", "legacy"):
+                print("caf: --fluid expects apic or legacy", file=sys.stderr)
+                return 2
+            fluid_mode = args[i+1]; i += 1
+        elif a == "--cup":
+            if i+1 >= len(args) or args[i+1] not in ("free", "locked"):
+                print("caf: --cup expects free or locked", file=sys.stderr)
+                return 2
+            cup_motion = args[i+1] == "free"; i += 1
+        elif a == "--studio":
+            cinematic = False
+        elif a == "--smooth":
+            dither = False
+        elif a == "--auto-level":
+            auto_level = True
+        elif a == "--calibrate":
+            return calibration_wizard(imu_read_sample, imu_start_bridge)
         elif a == "--weather":
             weather = True
         elif a == "--3d":
             three_d = True
+        elif a in ("--2d", "--flat"):
+            three_d = False
         elif a == "--sound":
             sound = True
         elif a == "--imu-bridge":
@@ -2034,35 +2547,51 @@ def main():
             if i + 1 < len(args) and args[i + 1].isdigit():
                 secs = int(args[i + 1]); i += 1
             return imu_bridge(debug_secs=secs)
+        elif a == "--imu-tilt":
+            secs = 30
+            if i + 1 < len(args) and args[i + 1].isdigit():
+                secs = int(args[i + 1]); i += 1
+            return imu_tilt_debug(secs)
         else:
             preset = ALIASES.get(a, a)
         i += 1
     if preset not in THEMES:
-        preset = "classic"
+        preset = "diner"
 
     caf_proc = None
     if not no_caf and not demo_frames and shutil.which("caffeinate"):
         caf_proc = subprocess.Popen(["caffeinate", "-d"],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # auto-start the IMU bridge so real laptop motion just works (M2+; the
-    # bridge exits harmlessly on machines without the sensor)
-    imu_proc = None
-    if not demo_frames and sys.platform == "darwin":
-        s = imu_read_sample()
-        if not s or abs(time.monotonic() - s[0]) > 0.6:
-            try:
-                imu_proc = subprocess.Popen(
-                    [os.path.abspath(__file__), "--imu-bridge", "--quiet"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except OSError:
-                imu_proc = None
+    # caffeinate only files power assertions, and lid close is a separate
+    # hardware sleep path that ignores them — so hand the session off to
+    # caf-lid-guard, which flips the kernel SleepDisabled flag and drops it
+    # again as soon as this pid dies. Run before the alt screen so its one
+    # sudo prompt lands on a normal terminal.
+    lid_guard = None
+    guard_bin = os.path.expanduser("~/.local/bin/caf-lid-guard")
+    if (not no_caf and not no_lid_guard and not demo_frames
+            and sys.platform == "darwin"
+            and os.getenv("CAF_NO_LID_GUARD") not in ("1", "true")
+            and os.access(guard_bin, os.X_OK)):
+        try:
+            if subprocess.call([guard_bin, "on", str(os.getpid())]) == 0:
+                lid_guard = guard_bin
+        except (OSError, KeyboardInterrupt):
+            lid_guard = None
+
+    # auto-start the IMU bridge so real laptop motion just works
+    imu_proc = None if demo_frames else imu_start_bridge()
 
     interactive = demo_frames == 0
     keyboard = interactive and sys.stdin.isatty()
     S = (2 if three_d else 4) if hires else 0
     scene = Scene(preset, hires_scale=S)
     scene.mode3d = three_d
+    scene.auto_level = auto_level
+    scene.cup_motion = cup_motion
+    scene.cinematic = cinematic
+    kit = None
     if sound and not demo_frames:
         kit = SoundKit()
         if kit.ok:
@@ -2085,7 +2614,26 @@ def main():
         old_termios = termios.tcgetattr(stdin_fd)
         tty.setcbreak(stdin_fd)
 
+    gpu = None
+    sensors = None
+    startup_input = ""
+
     def cleanup():
+        if kit:
+            kit.close()
+        if sensors:
+            sensors.close()
+        if gpu:
+            gpu.close()
+        if lid_guard:
+            # fire and forget — the guard's root watchdog also notices this pid
+            # dying on its own, so a hard kill still restores the flag
+            try:
+                subprocess.Popen([lid_guard, "off", str(os.getpid())],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
         if caf_proc:
             caf_proc.terminate()
         if imu_proc:
@@ -2094,25 +2642,56 @@ def main():
             import termios
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_termios)
         if interactive:
+            sys.stdout.write("\x1b_Ga=d,d=I,i=99,q=2;\x1b\\" if S or gpu else "")
+            if keyboard:
+                sys.stdout.write("\x1b[?1004l")
             sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
             sys.stdout.flush()
 
     signal.signal(signal.SIGINT, signal.default_int_handler)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
 
+    try:
+        supported = False
+        if not ansi and interactive:
+            supported, startup_input = probe_terminal(sys.stdin, sys.stdout)
+        elif not ansi and demo_frames:
+            supported = hires or renderer_mode == "metal"
+        wants_gpu = three_d and renderer_mode != "cpu" and not ansi and supported
+        if wants_gpu:
+            try:
+                gpu = MetalRenderer()
+                scene.real_fluid = fluid_mode == "apic"
+            except OSError as exc:
+                if renderer_mode == "metal":
+                    print(f"caf: {exc}; using CPU renderer", file=sys.stderr)
+        elif renderer_mode == "metal" and not supported:
+            print("caf: terminal did not confirm image support; using ANSI", file=sys.stderr)
+        S = 0 if gpu else ((2 if three_d else 4) if hires and supported and not ansi else 0)
+        scene.S = S
+        sensors = SensorSamples(imu_read_sample) if interactive else None
+    except BaseException:
+        cleanup()
+        raise
     if interactive:
         sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+        if keyboard:
+            sys.stdout.write("\x1b[?1004h")
+        sys.stdout.flush()
 
+    focused = True  # unsupported terminals keep running; never guess focus
     last_size = None
     frame_n = 0
     prev_lines = None
     prev_status = None
     prev_sparkle_rows = set()
     last_word_stamp = None
-    stdin_buf = ""
-    imu_at = 0.0
+    stdin_buf = startup_input
+    frame_previous = time.monotonic()
+    sim_accumulator = 0.0
     imu_prev_t = None
     imu_active = False
+    imu_resuming = False
     win_prev = None          # (t, x, y) last window position report
     win_query_at = 0.0
     WIN_RE = re.compile(r"\x1b\[3;(-?\d+);(-?\d+)t")
@@ -2120,36 +2699,54 @@ def main():
     try:
         while True:
             now = time.monotonic()
+            elapsed_frame = min(.25, max(0., now-frame_previous))
+            frame_previous = now
             cols, rows = (demo_size or shutil.get_terminal_size())
             cols, rows = max(20, cols), max(8, rows)
-            if (cols, rows) != last_size:
-                if last_size:
-                    scene.gust(cols - last_size[0])
-                if S:
-                    scene.layout(cols * S, (rows - 1) * S + 1)
-                else:
-                    scene.layout(cols, rows)
-                last_size = (cols, rows)
-                prev_lines = prev_status = None
-                if interactive:
-                    sys.stdout.write("\x1b[2J")
-                scene.particles = [p for p in scene.particles
-                                   if p[1] < scene.cup_top + scene.rim_h]
 
             if keyboard:
-                if now - win_query_at > 0.15:        # poll window position
+                if focused and now - win_query_at > 0.15:        # poll window position
                     win_query_at = now
                     sys.stdout.write("\x1b[13t")
                     sys.stdout.flush()
                 while select.select([sys.stdin], [], [], 0)[0]:
                     chunk = os.read(sys.stdin.fileno(), 256).decode(errors="ignore")
                     if not chunk:
-                        break
+                        raise KeyboardInterrupt
                     stdin_buf += chunk
+                # A fragmented/late graphics reply must never become sip/theme/quit keys.
+                apc_tail = ""
+                apc_at = stdin_buf.find("\x1b_G")
+                while apc_at >= 0:
+                    apc_end = stdin_buf.find("\x1b\\", apc_at)
+                    if apc_end < 0:
+                        apc_tail, stdin_buf = stdin_buf[apc_at:], stdin_buf[:apc_at]
+                        break
+                    stdin_buf = stdin_buf[:apc_at] + stdin_buf[apc_end+2:]
+                    apc_at = stdin_buf.find("\x1b_G")
+                focus_reports = re.findall(r"\x1b\[([IO])", stdin_buf)
+                if focus_reports:
+                    new_focus = focus_reports[-1] == "I"
+                    if new_focus != focused:
+                        focused = new_focus
+                        if sensors:
+                            sensors.set_paused(not focused)
+                        if not focused and kit:
+                            kit.close()  # stop existing incidental voices, keep kit reusable
+                        scene.snd = kit.play if focused and kit and kit.ok else None
+                        sim_accumulator = elapsed_frame = 0.0
+                        frame_previous = now
+                        imu_prev_t = win_prev = None
+                        imu_active = False
+                        scene.fluid_accel = (0., 0., 0.)
+                        if focused:
+                            imu_resuming = True
+                            prev_lines = prev_status = None
+                    stdin_buf = re.sub(r"\x1b\[[IO]", "", stdin_buf)
                 reports = WIN_RE.findall(stdin_buf)
                 if reports:
                     wx, wy = int(reports[-1][0]), int(reports[-1][1])
-                    if win_prev is not None:
+                    if focused and win_prev is not None:
                         dtw = now - win_prev[0]
                         if 0 < dtw < 1.0:
                             vx = (wx - win_prev[1]) / dtw
@@ -2158,7 +2755,7 @@ def main():
                                 scene.window_motion(vx, vy)
                     win_prev = (now, wx, wy)
                     stdin_buf = WIN_RE.sub("", stdin_buf)
-                if three_d:
+                if three_d and focused:
                     scene.yaw += 0.18 * (stdin_buf.count("\x1b[D") - stdin_buf.count("\x1b[C"))
                     scene.pitch = max(0.12, min(0.95, scene.pitch
                                                 + 0.08 * (stdin_buf.count("\x1b[A") - stdin_buf.count("\x1b[B"))))
@@ -2166,14 +2763,28 @@ def main():
                         scene.auto_orbit = not scene.auto_orbit
                 plain = CSI_RE.sub("", stdin_buf)
                 tail = re.search(r"\x1b(\[[0-9;?]*)?$", stdin_buf)
-                stdin_buf = tail.group(0) if tail else ""
+                stdin_buf = (tail.group(0) if tail else "") + apc_tail
                 for ch in plain:
+                    if not focused and ch != "q":
+                        continue
                     if ch == "s":
                         scene.sip(pomo=bool(pomo_end))
+                    elif ch == "f":
+                        scene.refill()
+                    elif ch == "r":
+                        scene.reset_fluid()
+                    elif ch == "m":
+                        scene.add_cream()
+                    elif ch == "k":
+                        scene.knock_over()
+                    elif ch == "l":
+                        scene.cinematic = not scene.cinematic
                     elif ch == " ":
                         scene.stir()
                     elif ch == "x":
                         scene.nudge()
+                    elif ch == "z":
+                        scene.imu_level()
                     elif ch == "w":
                         scene.write_word(time.strftime("%H:%M"))
                     elif ch == "t":
@@ -2182,30 +2793,31 @@ def main():
                     elif ch == "q":
                         raise KeyboardInterrupt
 
-            if cols < 26 or rows < 10:
-                if interactive:
-                    msg = f"{scene.theme['icon']} zzz… (terminal too small, still caffeinated)"
-                    sys.stdout.write(f"\x1b[H\x1b[2J\x1b[{rows // 2};1H" + msg[:cols].center(cols))
-                    sys.stdout.flush()
-                    time.sleep(0.5)
-                    scene.t += 0.5
-                    prev_lines = prev_status = None
+            # Drain timestamped samples buffered independently of expensive drawing.
+            for sample in sensors.drain() if sensors and focused else ():
+                if abs(now-sample[0]) >= .6:
                     continue
-
-            # real IMU samples, if a bridge is running
-            if interactive and now - imu_at > 0.06:
-                imu_at = now
-                s = imu_read_sample()
-                if s and abs(now - s[0]) < 0.6 and s[0] != imu_prev_t:
-                    scene.imu_input(s[1], s[2], now - (imu_prev_t or now - 0.07))
-                    if s[3] >= 0.0:
-                        scene.ambient_light(s[3], now - (imu_prev_t or now - 0.07))
-                    imu_prev_t = s[0]
-                    imu_active = True
-                elif not s or abs(now - s[0]) >= 0.6:
-                    if imu_active:
-                        scene.tilt_in = (0.0, 0.0)
-                    imu_active = False
+                sample_dt = sample[0] - imu_prev_t if imu_prev_t is not None else .01
+                if sample_dt <= 0:
+                    continue
+                if imu_resuming:
+                    scene.resume_imu(sample[1])
+                    imu_resuming = False
+                    # Reacquire current pose, not a stale inter-focus impulse.
+                    scene.imu_input(sample[1], (0., 0., 0.), sample_dt)
+                    scene.fluid_accel = (0., 0., 0.)
+                else:
+                    scene.imu_input(sample[1], sample[2], sample_dt)
+                if sample[3] >= 0.:
+                    scene.ambient_light(sample[3], sample_dt)
+                imu_prev_t = sample[0]
+                imu_active = True
+            if imu_active and (imu_prev_t is None or now-imu_prev_t >= .6):
+                scene.tilt_in = (0., 0.)
+                scene.roll = 0.
+                scene.gravity = (0., -1., 0.)
+                scene.fluid_accel = (0., 0., 0.)
+                imu_active = False
 
             # pomodoro drives the level
             extra = ""
@@ -2213,6 +2825,7 @@ def main():
                 rem = pomo_end - now
                 if rem <= 0:
                     sys.stdout.write("\a")
+                    sys.stdout.flush()
                     if scene.snd:
                         scene.snd("chime", 0.6)
                     if pomo_phase == "work":
@@ -2227,6 +2840,11 @@ def main():
                 total = 5 * 60 if pomo_phase == "break" else pomo_min * 60
                 frac = max(0.0, min(1.0, rem / total))
                 scene.target_level = max(0.05, frac if pomo_phase == "work" else 1 - frac)
+                if scene.real_fluid and focused:
+                    # Remove only excess coffee during work; never undo a spill.
+                    # Break refill is an explicit bounded source, not scalar healing.
+                    scene.fluid_events.append({"kind": "target", "level": scene.target_level,
+                                               "fill": pomo_phase == "break"})
                 pm, ps = divmod(int(rem), 60)
                 extra = f" · \U0001f345 {pomo_phase} {pm:02d}:{ps:02d}"
             elif not zen and not scene.word:
@@ -2237,8 +2855,44 @@ def main():
                     last_word_stamp = stamp
                     scene.write_word(time.strftime("%H:%M"))
 
+            if not focused:
+                # Keep wall-clock Pomodoro and power assertions alive, but do no
+                # drawing, physics, position queries, heat sampling or foley.
+                # select wakes immediately on focus-in/quit; timers tick at 1 Hz.
+                sim_accumulator = 0.0
+                select.select([sys.stdin], [], [], 1.0)
+                frame_previous = time.monotonic()
+                continue
+
+            if (cols, rows) != last_size:
+                if last_size:
+                    scene.gust(cols - last_size[0])
+                if S:
+                    scene.layout(cols * S, (rows - 1) * S + 1)
+                else:
+                    scene.layout(cols, rows)
+                last_size = (cols, rows)
+                prev_lines = prev_status = None
+                if interactive:
+                    sys.stdout.write("\x1b[2J")
+                scene.particles = [p for p in scene.particles
+                                   if p[1] < scene.cup_top + scene.rim_h]
+
+
+            if cols < 26 or rows < 10:
+                if interactive:
+                    msg = f"{scene.theme['icon']} zzz… (terminal too small, still caffeinated)"
+                    sys.stdout.write(f"\x1b[H\x1b[2J\x1b[{rows // 2};1H" + msg[:cols].center(cols))
+                    sys.stdout.flush()
+                    time.sleep(0.5)
+                    scene.t += 0.5
+                    prev_lines = prev_status = None
+                    continue
+
             if imu_active:
-                extra += " · imu"
+                extra += " · imu" + (" calibrated" if scene._calibration else "")
+            if gpu:
+                extra += " · metal"
 
             # zen: slow theme crossfade + occasional auto-stir
             if zen:
@@ -2259,14 +2913,36 @@ def main():
                 if random.random() < 0.0005:
                     scene.stir()
 
-            dt = (0.15 if three_d else 0.1) if S else 0.066
-            scene.t += dt
-            scene.step(dt)
-            px, sgrid = scene.draw()
+            frame_budget = 1/30 if gpu else (.10 if S else 1/15)
+            sim_accumulator += frame_budget if demo_frames else elapsed_frame
+            while sim_accumulator >= 1/30:
+                scene.t += 1/30
+                scene.step(1/30)
+                sim_accumulator -= 1/30
+            png = None
+            if gpu:
+                try:
+                    gw, gh = dimensions(cols, rows)
+                    png = rgb_png(gw, gh, gpu.render(scene, gw, gh, dither))
+                except (OSError, ValueError):
+                    gpu.close()
+                    gpu = None
+                    scene.real_fluid = False
+                    scene.target_level = scene.level
+                    scene.fluid_events.clear()
+                    scene.S = S = 0
+                    last_size = None
+                    prev_lines = prev_status = None
+                    scene.layout(cols, rows)
+                    sys.stdout.write("\x1b_Ga=d,d=I,i=99,q=2;\x1b\\\x1b[2J")
+                    extra += " · GPU stopped; CPU fallback"
+            if png is None:
+                px, sgrid = scene.draw()
             status = scene.status(now - start, keyboard, extra, zen, width=cols)
 
-            if S:
-                png = px_to_png(px, scene.W, scene.H)
+            if png is not None or S:
+                if png is None:
+                    png = px_to_png(px, scene.W, scene.H)
                 buf = kitty_emit(png, cols, rows - 1)
                 if status != prev_status:
                     buf += f"\x1b[{rows};1H\x1b[2K{status}"
@@ -2293,7 +2969,9 @@ def main():
             if demo_frames and frame_n >= demo_frames:
                 print()
                 return 0
-            time.sleep(dt)
+            # sleep out the rest of the frame, not another whole one: the 3d
+            # march costs ~30 ms and sim time is supposed to track wall time
+            time.sleep(max(0.004, frame_budget - (time.monotonic() - now)))
     except KeyboardInterrupt:
         pass
     finally:

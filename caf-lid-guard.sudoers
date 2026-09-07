@@ -1,0 +1,32 @@
+# caf-lid-guard sudoers rule  —  install to /etc/sudoers.d/caf-lid-guard
+#
+# Optional. Without it caf-lid-guard still works, it just asks for your
+# password once per caf session. With it, caf runs prompt-free.
+#
+# The rule grants NOPASSWD for exactly `pmset {-a|-b|-c} disablesleep {0|1}`
+# and nothing else — not pmset in general, not any other argument shape.
+# That is the only privileged thing caf-lid-guard ever does.
+#
+# FIRST-TIME SETUP (copy/paste the whole block):
+#
+#   curl -fsSL https://raw.githubusercontent.com/bookernath/caf/main/caf-lid-guard.sudoers \
+#     | sed "s/^YOURUSER/$(id -un)/" > /tmp/caf-lid-guard.sudoers
+#   sudo visudo -c -f /tmp/caf-lid-guard.sudoers \
+#     && sudo install -m 0440 -o root -g wheel \
+#          /tmp/caf-lid-guard.sudoers /etc/sudoers.d/caf-lid-guard \
+#     && rm /tmp/caf-lid-guard.sudoers
+#
+# `visudo -c` validates before installing — never write to /etc/sudoers.d
+# without it, a malformed file there can lock you out of sudo entirely.
+#
+# Inspect granted commands: sudo -l
+# Remove:  sudo rm /etc/sudoers.d/caf-lid-guard
+
+Cmnd_Alias CAF_DISABLESLEEP = /usr/bin/pmset -a disablesleep 0, \
+                              /usr/bin/pmset -a disablesleep 1, \
+                              /usr/bin/pmset -b disablesleep 0, \
+                              /usr/bin/pmset -b disablesleep 1, \
+                              /usr/bin/pmset -c disablesleep 0, \
+                              /usr/bin/pmset -c disablesleep 1
+
+YOURUSER ALL=(root) NOPASSWD: CAF_DISABLESLEEP

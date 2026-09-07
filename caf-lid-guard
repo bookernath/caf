@@ -1,0 +1,216 @@
+#!/bin/bash
+# caf-lid-guard — keep the Mac awake with the lid closed, for the lifetime of a
+# caf session. Companion to ~/.local/bin/caf-art.
+#
+# WHY THIS EXISTS
+#   `caffeinate` (any flag, including -s) only files IOKit power *assertions*.
+#   Lid close is not idle sleep: it's a separate hardware-triggered sleep path
+#   that ignores assertions entirely. So `caffeinate -d` keeps the screen lit
+#   but the machine still suspends the instant the lid shuts.
+#
+#   Amphetamine's "Closed-Display Mode" used to set the private assertion
+#   property kIOPMAssertionAppliesOnLidClose ("AppliesOnLidClose"). Apple locked
+#   that behind the restricted entitlement com.apple.private.iokit.assertonlidclose
+#   in 10.13, so no unsigned/third-party binary can use it anymore. Every current
+#   app that does this (Amphetamine, Fermata, Clamshell, ...) ends up at the same
+#   place: the kernel-level SleepDisabled flag, i.e. `pmset disablesleep 1`.
+#   That's the only lever left, and it needs root.
+#
+# WHAT THIS DOES
+#   1. Sets SleepDisabled=1. If /etc/sudoers.d/caf-lid-guard is installed
+#      (NOPASSWD for exactly `pmset -a|-b|-c disablesleep 0|1`), this needs no
+#      prompt at all and the watchdog runs unprivileged, restoring the flag
+#      through the same rule. Without the rule it falls back to the original
+#      behavior: one interactive sudo prompt that forks a root watchdog.
+#   2. The watchdog clears the flag the moment the owning caf process goes
+#      away — normal exit, Ctrl+C, SIGKILL, terminal closed, crash.
+#   3. While the lid is shut it parks the internal panel once per close
+#      (`pmset displaysleepnow`), since SleepDisabled otherwise leaves it lit
+#      and cooking under a closed lid.
+#
+# Usage: caf-lid-guard on <owner_pid> | off | status
+
+set -u
+
+STATE_DIR="${HOME}/.local/state/caf-lid-guard"
+POLL=2
+
+# absolute path to self — sudo needs it, and $0 may be a bare name from PATH
+case "$0" in
+  */*) SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" ;;
+  *)   SELF="$(command -v "$0")" ;;
+esac
+
+sleep_disabled_now() {
+  local v
+  v="$(/usr/bin/pmset -g 2>/dev/null | /usr/bin/awk '/SleepDisabled/{print $2; exit}')"
+  [ -n "$v" ] || v=0
+  echo "$v"
+}
+
+pmset_root() {
+  # sudo -n: succeeds silently under the /etc/sudoers.d/caf-lid-guard NOPASSWD
+  # rule, fails without prompting when the rule is absent (caller falls back)
+  if [ "$(id -u)" -eq 0 ]; then
+    /usr/bin/pmset "$@"
+  else
+    /usr/bin/sudo -n -- /usr/bin/pmset "$@"
+  fi
+}
+
+set_sleep_disabled() {
+  # -a is what we want (lid close sleeps on AC too, absent a real clamshell
+  # setup). Some releases only take the per-source forms, hence the fallback.
+  pmset_root -a disablesleep "$1" 2>/dev/null && return 0
+  pmset_root -b disablesleep "$1" 2>/dev/null
+  pmset_root -c disablesleep "$1" 2>/dev/null
+}
+
+lid_closed() {
+  /usr/sbin/ioreg -r -k AppleClamshellState -d 4 2>/dev/null \
+    | /usr/bin/grep -q '"AppleClamshellState" = Yes'
+}
+
+live_sessions() {
+  local f pid n=0
+  for f in "$STATE_DIR"/session.*; do
+    [ -e "$f" ] || continue
+    pid="${f##*/session.}"
+    if kill -0 "$pid" 2>/dev/null; then
+      n=$((n + 1))
+    else
+      rm -f "$f"   # stale: owner died without releasing
+    fi
+  done
+  echo "$n"
+}
+
+# ---------------------------------------------------------------- root half --
+
+# Runs as root under sudo. Sets the flag, detaches a watchdog, returns at once.
+# STATE_DIR is passed in: sudo may reset HOME to /var/root.
+cmd_root_start() {
+  local owner="$1" prev="$2"
+  set_sleep_disabled 1
+  nohup "$SELF" __watch "$owner" "$prev" "$STATE_DIR" >>"${STATE_DIR}/guard.log" 2>&1 &
+  disown 2>/dev/null || true
+  return 0
+}
+
+cmd_watch() {
+  local owner="$1" prev="$2" parked=0
+  while [ -e "${STATE_DIR}/session.${owner}" ] && kill -0 "$owner" 2>/dev/null; do
+    if lid_closed; then
+      # once per close, not every tick — repeated calls fight the terminal's
+      # own tty activity and just strobe the backlight
+      if [ "$parked" -eq 0 ]; then
+        /usr/bin/pmset displaysleepnow 2>/dev/null
+        parked=1
+      fi
+    else
+      parked=0
+    fi
+    sleep "$POLL"
+  done
+  rm -f "${STATE_DIR}/session.${owner}"
+  # another caf session may still be holding the flag
+  if [ "$(live_sessions)" -eq 0 ]; then
+    set_sleep_disabled "$prev"
+    rm -f "${STATE_DIR}/prev"
+  fi
+}
+
+# ---------------------------------------------------------------- user half --
+
+cmd_on() {
+  local owner="${1:-$PPID}" prev
+  mkdir -p "$STATE_DIR"
+  live_sessions >/dev/null   # reap stale sessions first
+
+  if [ -e "${STATE_DIR}/session.${owner}" ]; then
+    echo "caf-lid-guard: already guarding pid ${owner}" >&2
+    return 0
+  fi
+
+  # The pre-caf value is recorded once, by the first session. Later sessions
+  # must reuse it — reading it live would just read our own 1 back and then
+  # "restore" the flag to on forever.
+  # (a prev file with no live sessions means an earlier watchdog was killed
+  # before it could restore — we still own that flag, so reclaim it)
+  if [ -f "${STATE_DIR}/prev" ]; then
+    prev="$(cat "${STATE_DIR}/prev")"
+  else
+    prev="$(sleep_disabled_now)"
+    if [ "$prev" = "1" ]; then
+      # someone else (Amphetamine, a manual pmset) owns this — don't clobber it,
+      # and don't restore it to 0 on the way out
+      echo "caf-lid-guard: lid-close sleep already disabled by something else; leaving it alone"
+      return 0
+    fi
+    echo "$prev" >"${STATE_DIR}/prev"
+  fi
+
+  : >"${STATE_DIR}/session.${owner}"
+
+  give_up() {
+    rm -f "${STATE_DIR}/session.${owner}"
+    [ "$(live_sessions)" -eq 0 ] && rm -f "${STATE_DIR}/prev"
+    echo "caf-lid-guard: $1; lid-close protection NOT active" >&2
+    return 1
+  }
+
+  # Passwordless path: with /etc/sudoers.d/caf-lid-guard installed, sudo -n
+  # sets the flag with no prompt, and the watchdog can run unprivileged since
+  # its eventual restore goes through the same NOPASSWD rule.
+  if set_sleep_disabled 1 && [ "$(sleep_disabled_now)" = "1" ]; then
+    [ -w "${STATE_DIR}/guard.log" ] || rm -f "${STATE_DIR}/guard.log"
+    nohup "$SELF" __watch "$owner" "$prev" "$STATE_DIR" >>"${STATE_DIR}/guard.log" 2>&1 &
+    disown 2>/dev/null || true
+    return 0
+  fi
+
+  # Fallback (no NOPASSWD rule): one interactive sudo, root watchdog so the
+  # teardown never re-prompts.
+  if sudo -n true 2>/dev/null; then
+    :
+  elif [ -t 0 ]; then
+    echo "☕ caf needs sudo once to keep the Mac awake with the lid closed"
+    echo "   (pmset disablesleep — cleared automatically when caf exits)"
+  else
+    give_up "no tty for sudo"; return 1
+  fi
+
+  if sudo -- "$SELF" __root_start "$owner" "$prev" "$STATE_DIR"; then
+    return 0
+  fi
+  give_up "sudo declined"; return 1
+}
+
+cmd_off() {
+  local owner="${1:-$PPID}" i
+  rm -f "${STATE_DIR}/session.${owner}"
+  # give the root watchdog a moment to notice and restore
+  for i in 1 2 3 4 5 6; do
+    [ "$(sleep_disabled_now)" = "1" ] || return 0
+    [ "$(live_sessions)" -gt 0 ] && return 0
+    sleep 0.5
+  done
+  return 0
+}
+
+cmd_status() {
+  local n
+  n="$(live_sessions)"
+  echo "SleepDisabled: $(sleep_disabled_now)"
+  echo "caf sessions holding the guard: ${n}"
+  if lid_closed; then echo "lid: closed"; else echo "lid: open"; fi
+}
+
+case "${1:-status}" in
+  on)          shift; cmd_on "${1:-}" ;;
+  off)         shift; cmd_off "${1:-}" ;;
+  status)      cmd_status ;;
+  __root_start) shift; STATE_DIR="$3"; cmd_root_start "$1" "$2" ;;
+  __watch)     shift; STATE_DIR="$3"; cmd_watch "$1" "$2" ;;
+  *) echo "usage: caf-lid-guard on <pid> | off <pid> | status" >&2; exit 2 ;;
+esac
