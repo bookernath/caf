@@ -182,18 +182,23 @@ kernel void cupStep(device CupBody &state [[buffer(14)]],device atomic_int *reac
     // "at rest" crept downhill by g*dt per substep. Accumulated impulses with a
     // Coulomb cone converge over the whole foot ring instead of letting the
     // first contacts in sequence take all the friction (drift + yaw spin).
+    // This is the static hold for a quasi-static cup; impacts and slides (a
+    // knock) keep the impulse-based response after projection below.
     int count=0;float4 cr[CUP_SOLVE],cn[CUP_SOLVE];float3 cjt[CUP_SOLVE];
-    for(int j=0;j<CUP_CONTACTS && count<CUP_SOLVE;j++) {
+    bool settled=length(beforeV-g*dt)<.5 && length(beforeW)<1.;
+    for(int j=0;settled && j<CUP_CONTACTS && count<CUP_SOLVE;j++) {
         float3 local=cupSupport(j);
         if(j>=192 && length(local.xz)<.78)continue;
         float3 p=cupWorld(local,b);float d=fixedSolid(p);
         if(d>=.004)continue;
-        cr[count]=float4(p-b.position.xyz,0.);cn[count]=float4(fixedNormal(p),max(0.f,d-.001));cjt[count]=0.;count++;
+        cr[count]=float4(p-b.position.xyz,0.);cn[count]=float4(fixedNormal(p),max(0.f,d-.0015));cjt[count]=0.;count++;
     }
     for(int it=0;it<CUP_ITERATIONS;it++)for(int k=0;k<count;k++) {
         float3 r=cr[k].xyz,n=cn[k].xyz,rn=cross(r,n);
         float3 v=b.velocity.xyz+cross(b.angular.xyz,r);
-        // Speculative: a contact still separated by a gap may close it, no more.
+        // Speculative: a contact may close its gap to a skin just outside the
+        // projection threshold, so resting contacts never trigger projection
+        // (whose rotational correction made a resting cup walk).
         float dj=(-cn[k].w/dt-dot(v,n))/(1.+dot(rn,inverseInertia(rn,b)));
         float jn=max(0.f,cr[k].w+dj);dj=jn-cr[k].w;cr[k].w=jn;
         addBodyImpulse(b,n*dj,r);
@@ -224,11 +229,16 @@ kernel void cupStep(device CupBody &state [[buffer(14)]],device atomic_int *reac
         b.rotation=normalize(b.rotation+.5*multiplyQ(float4(da,0),b.rotation));
     }
     // Constraint displacement defines the supported velocity; impacts then get
-    // a modest restitution. Friction was already solved predictively above.
+    // a modest restitution and, when not settled, sliding friction.
     b.velocity.xyz=(b.position.xyz-oldPos)/dt;
     float4 dq=multiplyQ(b.rotation,float4(-oldQ.xyz,oldQ.w));
     b.angular.xyz=dq.xyz*(dq.w<0.?-2.:2.)/dt;
     int contacts=0;
+    for(int j=0;j<CUP_CONTACTS;j++) {
+        float3 local=cupSupport(j);
+        if(j>=192 && length(local.xz)<.78)continue;
+        if(fixedSolid(cupWorld(local,b))<.004)contacts++;
+    }
     for(int pass=0;pass<2;pass++)for(int k=0;k<CUP_CONTACTS;k++) {
         int j=(pass&1)?CUP_CONTACTS-1-k:k;
         float3 local=cupSupport(j);
@@ -236,16 +246,24 @@ kernel void cupStep(device CupBody &state [[buffer(14)]],device atomic_int *reac
         float3 p=cupWorld(local,b);float d=fixedSolid(p);
         b.contact.z=max(b.contact.z,max(0.f,-d));
         if(d>=.004)continue;
-        if(pass==0)contacts++;
         float3 n=fixedNormal(p),r=p-b.position.xyz;
-        float oldVN=dot(beforeV+cross(beforeW,r),n);
+        // Approach speed before this substep's gravity: otherwise a resting cup
+        // "impacts" (and bounces) every substep once g*dt exceeds the threshold.
+        float oldVN=dot(beforeV-g*dt+cross(beforeW,r),n);
         float3 v=b.velocity.xyz+cross(b.angular.xyz,r);
         float vn=dot(v,n);
         float3 rn=cross(r,n);
         float desired=oldVN<-.6 ? -oldVN*.09 : 0.;
         float jn=max(0.f,desired-vn)/(1.+dot(rn,inverseInertia(rn,b)));
         addBodyImpulse(b,n*jn,r);
-        b.contact.y=max(b.contact.y,length(v-n*vn));
+        float3 tangent=v-n*vn;float vt=length(tangent);
+        if(!settled && vt>1e-6) {
+            float3 direction=tangent/vt,rt=cross(r,direction);
+            float jt=vt/(1.+dot(rt,inverseInertia(rt,b)));
+            float normalBudget=jn+length(g)*dt/max(1,contacts)*.5;
+            addBodyImpulse(b,-direction*min(jt,normalBudget*CUP_FRICTION),r);
+        }
+        b.contact.y=max(b.contact.y,vt);
         b.contact.x=max(b.contact.x,max(0.f,-oldVN-.3));
     }
     if(contacts>0)b.angular.xyz*=exp(-dt*.65); // rolling resistance on glazed ceramic/wood
