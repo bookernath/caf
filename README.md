@@ -19,7 +19,15 @@ terminal names alone are not treated as proof of image support.
 - Restrained red/teal diner neon and occasional passing-headlight sweeps; `l` toggles
   them, or start with `--studio` for the simpler lighting.
 - World-space steam follows both tilt axes; the steam-written clock still works.
-- Fine, stable ordered dithering (`--smooth` disables it), not low-resolution upscaling.
+- Fine, stable ordered dithering (`--smooth` swaps it for static ±1 LSB noise), not
+  low-resolution upscaling.
+- GPU image pipeline: warm key + cool sky ambient, normalized GGX specular with
+  Schlick Fresnel, footprint-filtered wood grain/stripes, Beer-Lambert steam with
+  self-shadowing, PBR Neutral shoulder tonemap and exact sRGB encoding (optional
+  `"exposure"` request key, default 1). A still view accumulates Halton-jittered
+  samples into a persistent history (neighbourhood-clipped; rejected when the surface
+  under a pixel changes); any camera or cup motion resets it, and those frames
+  supersample only material/depth edges instead.
 - Ambient light changes the warm/cool lighting balance. The camera rests by default;
   press `o` for auto-orbit.
 - Bounded 30 FPS target, up to 960×720 real pixels. Sensor samples are buffered
