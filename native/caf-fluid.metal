@@ -682,29 +682,90 @@ kernel void fluidEvents(device FluidParticle *particles [[buffer(0)]],device con
     }
     particles[i]=p;
 }
-// Fine, covariance-aware moving-least-squares reconstruction. A sparse
-// occupancy mask skips empty space; local normal-direction variance thins
-// sheets/puddles without forcing the liquid back into the cup or deleting mass.
-kernel void fluidSurface(device const FluidParticle *particles [[buffer(0)]],device const int *heads [[buffer(1)]],
-                         device const int *next [[buffer(2)]],device const uint *active [[buffer(3)]],
-                         device float4 *field [[buffer(11)]],uint i [[thread_position_in_grid]]) {
-    if(i>=uint(SURFACE.x*SURFACE.y*SURFACE.z))return;
-    int3 fine=int3(i%SURFACE.x,(i/SURFACE.x)%SURFACE.y,i/(SURFACE.x*SURFACE.y));
-    float3 p=ORIGIN+(float3(fine)+.5)*SURFACE_DX;int3 c=particleCell(p);
-    if(!inGrid(c)||!active[cellIndex(c)]){field[i]=float4(.12,0,0,0);return;}
-    float3 center=0.,diagonal=0.,off=0.;float total=0.,milk=0.,milkWeight=0.,coarseMilk=0.,nearest=.12,totalRadius=0.;
-    float radius=DX*1.25;
+// Anisotropic (Yu-Turk) surface kernels. Per particle: neighbour covariance ->
+// principal axes; the kernel keeps its in-plane radius but narrows across
+// sheets (to half), so a spill sheet is averaged along its plane rather than
+// following every particle's bump. Centres are Laplacian-smoothed toward the
+// neighbour mean (bounded shift), which removes per-particle jitter. Written
+// into the solver buffer, dead between substeps: 3 float4 per slot.
+constant float KERNEL_RADIUS=DX*1.25;
+constant float CENTRE_SMOOTHING=.9;
+constant float CENTRE_SHIFT=.012;
+void eigenSymmetric(float3x3 a,thread float3 &e,thread float3x3 &v) {
+    v=float3x3(1.);
+    for(int sweep=0;sweep<5;sweep++)for(int k=0;k<3;k++) {
+        int p=k==2?1:0,q=k==0?1:2;float apq=a[q][p];
+        if(abs(apq)<1e-14)continue;
+        float theta=(a[q][q]-a[p][p])/(2.*apq);
+        float t=(theta>=0.?1.:-1.)/(abs(theta)+sqrt(theta*theta+1.));
+        float c=rsqrt(t*t+1.),s=t*c;
+        float3x3 j=float3x3(1.);j[p][p]=c;j[q][q]=c;j[q][p]=s;j[p][q]=-s;
+        a=transpose(j)*a*j;v=v*j;
+    }
+    e=float3(a[0][0],a[1][1],a[2][2]);
+}
+kernel void fluidAnisotropy(device const FluidParticle *particles [[buffer(0)]],device const int *heads [[buffer(1)]],
+                            device const int *next [[buffer(2)]],device atomic_uint *details [[buffer(16)]],
+                            device float4 *solver [[buffer(29)]],uint i [[thread_position_in_grid]]) {
+    if(i>=atomic_load_explicit(details,memory_order_relaxed))return;
+    FluidParticle p=particles[i];int3 c=particleCell(p.x.xyz);
+    if(!particleAlive(p)||p.cx.w>0.||!inGrid(c)){solver[3*i]=0.;return;} // .w = 0: not in the field
+    float3 sum=0.;float3x3 outer=float3x3(0.);float total=0.;int count=0;
     for(int z=-1;z<=1;z++)for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++) {
         int3 q=c+int3(x,y,z);if(!inGrid(q))continue;
         for(int j=heads[cellIndex(q)];j>=0;j=next[j]) {
-            FluidParticle particle=particles[j];if(particle.cx.w>0.)continue;float3 delta=particle.x.xyz-p;
-            float d=length(delta);nearest=min(nearest,d-particleRadius(particle));
-            float w=1.-d*d/(radius*radius);w=w>0.?w*w*w*particleWeight(particle):0.;
-            totalRadius+=particleRadius(particle)*w;
+            FluidParticle o=particles[j];if(o.cx.w>0.||int(i)==j)continue;
+            float3 d=o.x.xyz-p.x.xyz;float r=length(d)/DX;if(r>=1.)continue;
+            float w=(1.-r*r*r)*particleWeight(o);
+            sum+=w*d;outer+=w*float3x3(d*d.x,d*d.y,d*d.z);total+=w;count++;
+        }
+    }
+    float3 radii=KERNEL_RADIUS;float3x3 axes=float3x3(1.);float3 centre=p.x.xyz;
+    if(count>=4) {
+        float3 mean=sum/total,shift=CENTRE_SMOOTHING*mean*total/(total+particleWeight(p));
+        centre+=shift*min(1.f,CENTRE_SHIFT/max(length(shift),1e-6f));
+        if(count>=10) {
+            float3x3 covariance=outer*(1./total)-float3x3(mean*mean.x,mean*mean.y,mean*mean.z);
+            float3 e;eigenSymmetric(covariance,e,axes);
+            float3 sigma=sqrt(max(e,float3(1e-12)));
+            radii=KERNEL_RADIUS*clamp(sigma/max(sigma.x,max(sigma.y,sigma.z)),.5f,1.f);
+        }
+    }
+    // G = R diag(1/r) R^T (symmetric): kernel argument s = |G (x - centre)|.
+    float3x3 g=axes*float3x3(float3(1./radii.x,0,0),float3(0,1./radii.y,0),float3(0,0,1./radii.z))*transpose(axes);
+    // Everything fluidSurface needs, so its gather never touches the particles.
+    solver[3*i]=float4(centre,particleWeight(p));
+    solver[3*i+1]=float4(g[0][0],g[1][1],g[2][2],g[1][0]);
+    solver[3*i+2]=float4(g[2][0],g[2][1],particleRadius(p),p.v.w);
+}
+// Covariance-aware moving-least-squares reconstruction over the anisotropic
+// kernels. A sparse occupancy mask skips empty space; local normal-direction
+// variance thins sheets/puddles without forcing liquid back into the cup or
+// deleting mass. The raw distance goes to .w; fluidSurfaceSmooth filters and
+// blends it into .x (the renderer's signed distance).
+kernel void fluidSurface(device const FluidParticle *particles [[buffer(0)]],device const int *heads [[buffer(1)]],
+                         device const int *next [[buffer(2)]],device const uint *active [[buffer(3)]],
+                         device float4 *field [[buffer(11)]],device float4 *solver [[buffer(29)]],
+                         uint i [[thread_position_in_grid]]) {
+    if(i>=uint(SURFACE.x*SURFACE.y*SURFACE.z))return;
+    int3 fine=int3(i%SURFACE.x,(i/SURFACE.x)%SURFACE.y,i/(SURFACE.x*SURFACE.y));
+    float3 p=ORIGIN+(float3(fine)+.5)*SURFACE_DX;int3 c=particleCell(p);
+    if(!inGrid(c)||!active[cellIndex(c)]){field[i]=float4(.12,0,0,.12);return;}
+    float3 center=0.,diagonal=0.,off=0.;float total=0.,milk=0.,milkWeight=0.,coarseMilk=0.,nearest=.12,totalRadius=0.;
+    for(int z=-1;z<=1;z++)for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++) {
+        int3 q=c+int3(x,y,z);if(!inGrid(q))continue;
+        for(int j=heads[cellIndex(q)];j>=0;j=next[j]) {
+            float4 a=solver[3*j];if(a.w<=0.)continue;
+            float4 b=solver[3*j+1],e=solver[3*j+2];
+            float3 delta=a.xyz-p;float r2=dot(delta,delta);
+            nearest=min(nearest,sqrt(r2)-e.z);
+            float3 u=float3(b.x*delta.x+b.w*delta.y+e.x*delta.z,b.w*delta.x+b.y*delta.y+e.y*delta.z,e.x*delta.x+e.y*delta.y+b.z*delta.z);
+            float w=1.-dot(u,u);w=w>0.?w*w*w*a.w:0.;
+            totalRadius+=e.z*w;
             center+=delta*w;diagonal+=delta*delta*w;
             off+=float3(delta.x*delta.y,delta.x*delta.z,delta.y*delta.z)*w;
-            float mw=1.-d*d/(.06*.06);mw=mw>0.?mw*mw*mw*particleWeight(particle):0.;
-            milk+=particle.v.w*mw;milkWeight+=mw;coarseMilk+=particle.v.w*w;total+=w;
+            float mw=1.-r2/(.06*.06);mw=mw>0.?mw*mw*mw*a.w:0.;
+            milk+=e.w*mw;milkWeight+=mw;coarseMilk+=e.w*w;total+=w;
         }
     }
     float phi=nearest;
@@ -721,7 +782,31 @@ kernel void fluidSurface(device const FluidParticle *particles [[buffer(0)]],dev
         phi=distance-thickness;
     }
     float concentration=milkWeight>1e-6?milk/milkWeight:(total>1e-6?coarseMilk/total:0.);
-    field[i]=float4(clamp(phi,-.1f,.12f),concentration,total,0.);
+    field[i]=float4(field[i].x,concentration,total,clamp(phi,-.1f,.12f));
+}
+// One band-limited Laplacian pass (|change| <= half a voxel, so sheets thin
+// but do not tear), then motion-adaptive temporal blending with the previous
+// frame: sub-voxel jitter is averaged away, real motion passes straight through.
+kernel void fluidSurfaceSmooth(device float4 *field [[buffer(11)]],device const uint *active [[buffer(3)]],
+                               device const float *s [[buffer(10)]],uint i [[thread_position_in_grid]]) {
+    if(i>=uint(SURFACE.x*SURFACE.y*SURFACE.z))return;
+    int3 fine=int3(i%SURFACE.x,(i/SURFACE.x)%SURFACE.y,i/(SURFACE.x*SURFACE.y));
+    int3 c=particleCell(ORIGIN+(float3(fine)+.5)*SURFACE_DX);
+    if(!inGrid(c)||!active[cellIndex(c)])return; // fluidSurface already wrote .12
+    float raw=field[i].w,phi=raw;
+    if(abs(raw)<3.*SURFACE_DX) {
+        float sum=0.;
+        for(int a=0;a<3;a++)for(int direction=-1;direction<=1;direction+=2) {
+            int3 q=fine;q[a]=clamp(q[a]+direction,0,SURFACE[a]-1);
+            sum+=field[(q.z*SURFACE.y+q.y)*SURFACE.x+q.x].w;
+        }
+        phi+=clamp(.5*(sum/6.-raw),-.5f*SURFACE_DX,.5f*SURFACE_DX);
+    }
+    if(s[24]>0.) {
+        float old=field[i].x,change=abs(phi-old);
+        phi=mix(phi,old,.5*(1.-smoothstep(.25f*SURFACE_DX,1.5f*SURFACE_DX,change)));
+    }
+    field[i].x=clamp(phi,-.1f,.12f);
 }
 float4 fluidSample(float3 p,device const float *raw) {
     device const float4 *field=reinterpret_cast<device const float4 *>(raw);

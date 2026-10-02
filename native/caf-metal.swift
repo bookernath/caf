@@ -52,7 +52,7 @@ do {
     let source = try "#define CAF_SCENE_LAYOUT 5\n" + String(contentsOf: sceneURL, encoding: .utf8) + "\n" + String(contentsOf: shaderURL, encoding: .utf8) + "\n" + String(contentsOf: fluidURL, encoding: .utf8) + "\n" + String(contentsOf: detailURL, encoding: .utf8)
     let library = try device.makeLibrary(source: source, options: nil)
     for name in ["coffeePrep", "coffee", "coffeeEdges", "coffeeResolve", "fluidClear", "fluidBins", "fluidP2G", "fluidForces", "fluidDivergence",
-                 "fluidSolve", "fluidProject", "fluidVorticity", "fluidExtrapolate", "fluidG2P", "fluidEvents", "fluidSurface", "fluidStats", "fluidGridStats", "cupEvents", "cupStep", "fluidReaction", "fluidBreakup", "filmGather", "filmFlux", "filmAdvance", "filmCommit", "filmStats"] {
+                 "fluidSolve", "fluidProject", "fluidVorticity", "fluidExtrapolate", "fluidG2P", "fluidEvents", "fluidAnisotropy", "fluidSurface", "fluidSurfaceSmooth", "fluidStats", "fluidGridStats", "cupEvents", "cupStep", "fluidReaction", "fluidBreakup", "filmGather", "filmFlux", "filmAdvance", "filmCommit", "filmStats"] {
         guard let function = library.makeFunction(name: name) else { fail("missing kernel \(name)") }
         pipelines[name] = try device.makeComputePipelineState(function: function)
     }
@@ -69,6 +69,7 @@ final class Fluid {
     var lastSteps = 0
     var metadata: [String: Any] = [:]
     var surfaceDirty = true
+    var surfaceFresh = false // field holds the previous simulated frame (temporal blend)
     init(level: Float, device: MTLDevice) {
         let n = Fluid.cells
         let f = Fluid.filmCells
@@ -116,7 +117,7 @@ final class Fluid {
         buffers[16].contents().bindMemory(to:UInt32.self,capacity:32)[0]=UInt32(allocated)
         initial = allocated;creamRemaining=0;creamEmitted=0
         metadata = ["in_cup": allocated, "surface_height": 0.30+0.62*level]
-        surfaceDirty = true
+        surfaceDirty = true; surfaceFresh = false
     }
     func dispatch(_ name: String, _ count: Int, _ params: [Float], _ encoder: MTLComputeCommandEncoder) {
         if count <= 0 { return }
@@ -242,9 +243,12 @@ final class Fluid {
         if render && surfaceDirty {
             dispatch("fluidClear",Fluid.cells,p,encoder)
             dispatch("fluidBins",Fluid.slots,p,encoder)
+            dispatch("fluidAnisotropy",Fluid.slots,p,encoder)
             dispatch("fluidSurface",Fluid.surfaceCells,p,encoder)
-            surfaceDirty = false
-        }
+            p[24]=surfaceFresh ? 1:0
+            dispatch("fluidSurfaceSmooth",Fluid.surfaceCells,p,encoder)
+            surfaceDirty = false; surfaceFresh = true
+        } else if steps>0 {surfaceFresh = false}
         dispatch("fluidStats",Fluid.slots,p,encoder)
         dispatch("filmStats",Fluid.filmCells,p,encoder)
         encoder.endEncoding()
