@@ -1,5 +1,7 @@
 // Persistent Metal renderer + APIC simulation. stdin: bounded JSON lines.
 // stdout: CAF_METAL_5\n, then metadata length + JSON + RGB length + RGB bytes.
+// A frame naming a caller-created POSIX shm object ("shm") is rendered straight
+// into it (zero copy) and answered with an empty RGB packet and "shm": true.
 // No particle positions are read back during interactive rendering.
 import Foundation
 import Metal
@@ -18,6 +20,23 @@ func writePacket(_ data: Data) {
     var count = UInt32(data.count).littleEndian
     withUnsafeBytes(of: &count) { FileHandle.standardOutput.write(Data($0)) }
     FileHandle.standardOutput.write(data)
+}
+// shm_open is variadic, so Swift cannot import it; without O_CREAT the mode
+// argument is never read and a fixed two-argument call is ABI-safe.
+typealias ShmOpen = @convention(c) (UnsafePointer<CChar>, Int32) -> Int32
+let shmOpen = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "shm_open").map { unsafeBitCast($0, to: ShmOpen.self) }
+func sharedTarget(_ name: String, _ size: Int, _ device: MTLDevice) -> MTLBuffer? {
+    guard let open = shmOpen else { return nil }
+    let fd = open(name, O_RDWR)
+    if fd < 0 { return nil }
+    defer { close(fd) }
+    var st = stat()
+    let page = Int(getpagesize()), length = (size + page - 1) / page * page
+    guard fstat(fd, &st) == 0, Int(st.st_size) >= length,
+          let p = mmap(nil, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0), p != MAP_FAILED else { return nil }
+    guard let buffer = device.makeBuffer(bytesNoCopy: p, length: length, options: .storageModeShared,
+                                         deallocator: { p, n in munmap(p, n) }) else { munmap(p, length); return nil }
+    return buffer
 }
 guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
     fail("Metal unavailable")
@@ -274,7 +293,7 @@ while let line=readLine() {
               let frame=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any],
               var u=floats(frame["u"],count:36),let water=floats(frame["water"],count:54*26),
               let dots=floats(frame["dots"]),dots.count%4==0,dots.count<=420*4,
-              u[0]>=16,u[0]<=1280,u[1]>=16,u[1]<=960,
+              u[0]>=16,u[0]<=2560,u[1]>=16,u[1]<=1600,
               u[0].rounded()==u[0],u[1].rounded()==u[1],u[29]>=0,u[29]<=420,
               u[29].rounded()==u[29],Int(u[29])==dots.count/4 else {fail("invalid frame")}
         let width=Int(u[0]),height=Int(u[1]),size=width*height*3
@@ -282,7 +301,10 @@ while let line=readLine() {
         let enabled=u[32]>0.5
         if enabled && fluid==nil {fluid=Fluid(level:u[3],device:device)}
         if enabled {u[33]=Float((fluid!.metadata["surface_height"] as? NSNumber)?.floatValue ?? 0.9)}
-        if size != outputSize {output=device.makeBuffer(length:size,options:.storageModeShared);outputSize=size}
+        let shmName=frame["shm"] as? String
+        guard shmName.map({$0.hasPrefix("/") && $0.utf8.count<=30}) ?? true else {fail("invalid shm name")}
+        let shared=shouldRender ? shmName.flatMap {sharedTarget($0,size,device)} : nil
+        if shared==nil && size != outputSize {output=device.makeBuffer(length:size,options:.storageModeShared);outputSize=size}
         guard let command=queue.makeCommandBuffer() else {fail("command allocation")}
         if enabled {
             guard let settings=frame["fluid"] as? [String:Any] else {fail("missing fluid settings")}
@@ -290,7 +312,7 @@ while let line=readLine() {
         }
         if enabled {u[35]=fluid!.time}
         if shouldRender {
-            guard let target=output,
+            guard let target=shared ?? output,
                   let uniforms=device.makeBuffer(bytes:u,length:u.count*4,options:.storageModeShared),
                   let waves=device.makeBuffer(bytes:water,length:water.count*4,options:.storageModeShared),
                   let particles=device.makeBuffer(bytes:dots.isEmpty ? [Float](repeating:0,count:4):dots,
@@ -314,8 +336,9 @@ while let line=readLine() {
         guard command.status == .completed else {fail(command.error.map(String.init(describing:)) ?? "GPU failed")}
         var metadata:[String:Any]=enabled ? fluid!.readStats():["solver":"legacy"]
         metadata["gpu_ms"]=(command.gpuEndTime-command.gpuStartTime)*1000
+        if shared != nil {metadata["shm"]=true}
         guard let encoded=try? JSONSerialization.data(withJSONObject:metadata,options:[.sortedKeys]) else {fail("invalid fluid diagnostics")}
         writePacket(encoded)
-        writePacket(shouldRender ? Data(bytes:output!.contents(),count:size):Data())
+        writePacket(shouldRender && shared==nil ? Data(bytes:output!.contents(),count:size):Data())
     }
 }
