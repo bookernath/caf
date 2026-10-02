@@ -100,8 +100,8 @@ and collect on the table. Returning to level lets it settle; spilled coffee does
   existing simulation. Real 3D spilling requires the Metal helper.
 
 The free surface now uses a finer **224×128×224 covariance-aware reconstruction**
-over anisotropic (Yu–Turk) particle kernels: each particle's neighbour covariance
-narrows its kernel across sheets, centres are Laplacian-smoothed, and one
+over anisotropic (Yu–Turk) particle kernels: a particle's neighbour covariance
+narrows its kernel across airborne sheets, centres are Laplacian-smoothed, and one
 band-limited smoothing pass plus motion-adaptive blending with the previous frame
 remove particle-scale crumpling and flicker without lagging real motion. Thin
 sheets, bounded surface-tension forces and short-range rim adhesion remain. Density-drift
