@@ -20,20 +20,39 @@ kernel void fluidBreakup(device FluidParticle *particles [[buffer(0)]],
     float3 local=cupLocal(p.x.xyz,body);
     bool rim=local.y>.78 && local.y<1.13 && length(local.xz)>.75;
     // Resolve only sparse fast free edges, not the bulk or resting surface.
-    if(density>3. || speed<(rim?1.2:3.) || solidDistance(p.x.xyz,body)<.048)return;
-    if(i%5!=0 && !rim)return;
-    uint start=reserveSlots(details,7);if(start==SLOT_CAPACITY)return;
+    if(density>5. || speed<(rim?1.2:3.) || solidDistance(p.x.xyz,body)<.048)return;
     float3 affine[3]={p.cx.xyz,p.cy.xyz,p.cz.xyz};
     float3 sumVelocity=0.;
-    for(uint child=0;child<8;child++) {
-        float3 offset=float3(child&1?1.:-1.,child&2?1.:-1.,child&4?1.:-1.)*.010;
-        FluidParticle q=p;q.x=float4(p.x.xyz+offset,1.);
-        // Symmetric samples of the parent's affine field preserve momentum.
-        // Their fine-scale energy comes from the existing APIC affine motion.
-        q.v.xyz+=float3(dot(affine[0],offset),dot(affine[1],offset),dot(affine[2],offset));
-        q.cx=float4(0,0,0,.001);q.cy=0.;q.cz=0.;
-        sumVelocity+=q.v.xyz;
-        particles[child==0?i:start+child-1]=q;
+    if(density>1.5) {
+        // Resolvable sheet (an over-the-rim pour): reseed only where it is
+        // stretching, as four on-grid quarters spread along the two stretching
+        // axes of the APIC strain, so the sheet thins but stays continuous.
+        float3x3 gradient=transpose(float3x3(affine[0],affine[1],affine[2]));
+        float3 e;float3x3 axes;eigenSymmetric(.5*(gradient+transpose(gradient)),e,axes);
+        int k0=e.x>=e.y&&e.x>=e.z?0:(e.y>=e.z?1:2),k1=k0==0?(e.y>=e.z?1:2):(k0==1?(e.x>=e.z?0:2):(e.x>=e.y?0:1));
+        if(e[k0]<4.||e[k1]<-2.)return;
+        uint start=reserveSlots(details,3);if(start==SLOT_CAPACITY)return;
+        for(uint child=0;child<4;child++) {
+            float3 offset=axes[child<2?k0:k1]*((child&1)?.012:-.012);
+            FluidParticle q=p;q.x=float4(p.x.xyz+offset,2.);
+            q.v.xyz+=float3(dot(affine[0],offset),dot(affine[1],offset),dot(affine[2],offset));
+            sumVelocity+=q.v.xyz;
+            particles[child==0?i:start+child-1]=q;
+        }
+        sumVelocity*=2.;
+    } else {
+        if(i%5!=0 && !rim)return;
+        uint start=reserveSlots(details,7);if(start==SLOT_CAPACITY)return;
+        for(uint child=0;child<8;child++) {
+            float3 offset=float3(child&1?1.:-1.,child&2?1.:-1.,child&4?1.:-1.)*.010;
+            FluidParticle q=p;q.x=float4(p.x.xyz+offset,1.);
+            // Symmetric samples of the parent's affine field preserve momentum.
+            // Their fine-scale energy comes from the existing APIC affine motion.
+            q.v.xyz+=float3(dot(affine[0],offset),dot(affine[1],offset),dot(affine[2],offset));
+            q.cx=float4(0,0,0,.001);q.cy=0.;q.cz=0.;
+            sumVelocity+=q.v.xyz;
+            particles[child==0?i:start+child-1]=q;
+        }
     }
     atomic_fetch_max_explicit(details+9,uint(length(sumVelocity/8.-p.v.xyz)*1e6),memory_order_relaxed);
     atomic_fetch_add_explicit(details+1,1,memory_order_relaxed);

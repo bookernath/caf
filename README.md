@@ -117,17 +117,28 @@ and collect on the table. Returning to level lets it settle; spilled coffee does
 - `--fluid legacy`: the previous GPU heightfield; CPU/ANSI also retain their
   existing simulation. Real 3D spilling requires the Metal helper.
 
-The free surface now uses a finer **224×128×224 covariance-aware reconstruction**,
-with thinner sheet reconstruction, bounded surface-tension forces and short-range rim adhesion. Density-drift
+The free surface now uses a finer **224×128×224 covariance-aware reconstruction**
+over anisotropic (Yu–Turk) particle kernels: a particle's neighbour covariance
+narrows its kernel across airborne sheets, centres are Laplacian-smoothed, and one
+band-limited smoothing pass plus motion-adaptive blending with the previous frame
+remove particle-scale crumpling and flicker without lagging real motion. Thin
+sheets, bounded surface-tension forces and short-range rim adhesion remain. Density-drift
 correction prevents particle bunching from silently shrinking the visible liquid.
 The underlying pressure grid remains 56×32×56; this is still a finite-resolution
 real-time approximation, not film-grade splashes or a scientific CFD instrument.
 A model unit now represents **10 cm**: gravity and control impulses use mug-scale
 timing. Substeps adapt to the previous frame's fastest liquid and cup surface
 speed (CFL 0.8, between 1/120 and 1/480 second; knocks pre-arm fine steps), and
-particles advect with a midpoint step so a swirl does not spiral outward. Pressure
-sweeps visit only liquid cells (GPU-built red/black lists, indirect dispatch), and
-solid face fractions are computed once per substep. Projected velocities are
+particles advect with a midpoint step so a swirl does not spiral outward. The
+pressure solve is **MGPCG** in a single 1024-thread threadgroup (CG preconditioned
+by a 56→28→14 Galerkin multigrid V-cycle, stopping at an RMS divergence residual
+of 0.0005/s, typically 2–8 iterations), visiting only liquid cells. The free
+surface is **ghost-fluid**: a coarse level set from the particle density places
+p = 0 at the interpolated surface rather than at air-cell centres (θ ≥ 0.25 so
+pour streams still plunge). The curved, tilting cup is a **cut-cell** boundary:
+face open fractions weight the pressure matrix, divergence (with area-weighted wall
+velocity) and the pressure traction on the cup; the flat table/saucer stay binary.
+Projected velocities are
 extended two cells into the air so surface particles never sample raw, unprojected
 faces. Floor drag is time-scaled, rather than applied repeatedly during collision
 projection. Small ripples and thin films
@@ -137,6 +148,9 @@ below the grid resolution are still approximations.
 break into eight smaller ballistic droplets, preserving the parent's volume and
 linear momentum. Droplets rejoin the bulk flow on contact; cup and wet-surface
 impacts produce short-lived ripples rather than permanent animated noise.
+Resolvable sheets (an over-the-rim pour) are not dusted: where the APIC strain
+says a sheet is stretching, a particle is reseeded as four on-grid quarters along
+the two stretching axes, so the sheet thins but stays continuous.
 
 **Spills leave a wet surface behind.** A conservative thin-film layer spreads
 across the fixed saucer and table, with gravity-driven flow, glossy wetness and
