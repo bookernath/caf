@@ -214,16 +214,52 @@ float4 sampleFilm(float2 xz,device const uint4 *film,device const uint4 *dry) {
     sample.yzw*=FILM_VOLUME_Q/(FILM_DX*FILM_DX);
     return sample;
 }
-float wetHeight(int2 c,device const uint4 *film,device const float2 *ripples) {
+float2 wetHeight(int2 c,device const uint4 *film,device const float2 *ripples) {
     if(!inFilm(c))return 0.;int i=filmIndex(c);
-    return min(.012f,filmDepth(film[i].x))+ripples[i].x;
+    return float2(min(.012f,filmDepth(film[i].x)),ripples[i].x);
 }
+// Central-difference slopes per film cell, bilinearly blended: C0 normals
+// instead of one constant facet per 2 cm cell. Depth and ripple slopes are
+// kept apart so thin edges become a rounded meniscus while ripples stay soft.
 float3 wetNormal(float3 p,float3 n,device const uint4 *film,device const float2 *ripples) {
-    int2 c=filmCoord(p.xz);
-    float2 gradient=float2(wetHeight(c+int2(1,0),film,ripples)-wetHeight(c-int2(1,0),film,ripples),
-                           wetHeight(c+int2(0,1),film,ripples)-wetHeight(c-int2(0,1),film,ripples))/(2.*FILM_DX);
-    gradient=clamp(gradient*.45,-.18f,.18f);
+    float2 g=(p.xz-FILM_ORIGIN)/FILM_DX-.5;int2 c=int2(floor(g));float2 f=fract(g);
+    float2 h[4][4];
+    for(int y=0;y<4;y++)for(int x=0;x<4;x++)h[y][x]=wetHeight(c+int2(x-1,y-1),film,ripples);
+    float4 slope=0.;float depth=0.;
+    for(int y=1;y<3;y++)for(int x=1;x<3;x++) {
+        float w=(x==2?f.x:1.-f.x)*(y==2?f.y:1.-f.y);
+        slope+=w*float4(h[y][x+1]-h[y][x-1],h[y+1][x]-h[y-1][x]).xzyw;
+        depth+=w*h[y][x].x;
+    }
+    slope/=2.*FILM_DX;
+    // xy: depth slope (meniscus at the wet edge), zw: low-passed ripple slope.
+    float2 meniscus=clamp(slope.xy*.35,-.22f,.22f),ripple=clamp(slope.zw*.30,-.10f,.10f);
+    float2 gradient=(meniscus+ripple)*smoothstep(.00005f,.0012f,depth);
     return normalize(n-float3(gradient.x,0,gradient.y));
+}
+// Tricubic B-spline gradient of the reconstructed liquid distance. Trilinear
+// field samples are only C0, so their differences facet along voxel planes.
+float3 fluidGradient(float3 p,device const float *raw) {
+    device const float4 *field=reinterpret_cast<device const float4 *>(raw);
+    float3 g=(p-ORIGIN)/SURFACE_DX-.5;int3 c=int3(floor(g));float3 f=g-floor(g);
+    float3 w[4],d[4];
+    for(int k=0;k<3;k++) {
+        float t=f[k],s=1.-t;
+        w[0][k]=s*s*s/6.;w[1][k]=(3.*t*t*t-6.*t*t+4.)/6.;w[2][k]=(-3.*t*t*t+3.*t*t+3.*t+1.)/6.;w[3][k]=t*t*t/6.;
+        d[0][k]=-.5*s*s;d[1][k]=1.5*t*t-2.*t;d[2][k]=-1.5*t*t+t+.5;d[3][k]=.5*t*t;
+    }
+    float3 gradient=0.;
+    for(int z=0;z<4;z++)for(int y=0;y<4;y++) {
+        int cz=clamp(c.z+z-1,0,SURFACE.z-1),cy=clamp(c.y+y-1,0,SURFACE.y-1);
+        int row=(cz*SURFACE.y+cy)*SURFACE.x;
+        float3 a=0.;
+        for(int x=0;x<4;x++) {
+            float v=field[row+clamp(c.x+x-1,0,SURFACE.x-1)].x;
+            a+=v*float3(d[x].x,w[x].x,w[x].x);
+        }
+        gradient+=a*float3(w[y].y*w[z].z,d[y].y*w[z].z,w[y].y*d[z].z);
+    }
+    return gradient/SURFACE_DX;
 }
 float3 stainColor(float3 base,float4 sample) {
     float share=sample.y/max(1e-8f,sample.y+sample.z);
