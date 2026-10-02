@@ -433,25 +433,35 @@ float3 coffeeAbsorption(device const float *u) {
     float neutral=min(opticalDensity.x,min(opticalDensity.y,opticalDensity.z));
     return neutral*1.25+(opticalDensity-neutral)*3.5;
 }
+// Cream scattering per model unit (10 cm) at concentration 1. Milk fat
+// scatters ~10^3/cm, so even a 5% splash out-scatters coffee's absorption
+// several times over and turns the cup tan; at 32 it stayed invisible.
+constant float CREAM_SCATTER=300.;
 // Semi-infinite multiple-scattering reflectance for single-scatter albedo a:
 // coffee absorbed between many scattering events turns part-mixed cream tan.
 float3 multipleScatter(float3 a) {float3 s=sqrt(max(1.-a,0.f));return (1.-s)/(1.+s);}
 // One bounded refracted path through the actual reconstructed liquid. Coffee
 // absorbs light; only added cream scatters it. No opaque brown surface coat.
+// Seen from inside the liquid (submerged), a wet film is just more of the same
+// liquid: no ripple normal and no air-interface mirror, which under a puddle
+// read as crumpled cellophane.
 float3 transmittedSolid(float3 p,int mat,float3 rd,float fw,device const float *u,CupBody body,
-                        device const uint4 *film,device const uint4 *dry,device const float2 *waves) {
+                        device const uint4 *film,device const uint4 *dry,device const float2 *waves,bool submerged) {
     float3 n=solidNormal(p,body),l=keyDir();
     float3 base=material(p,mat,fw,u,body);
     float4 coating=0.;
     if((mat==1||mat==3)&&abs(p.y-filmBaseHeight(p.xz))<.025) {
         coating=sampleFilm(p.xz,film,dry);base=stainColor(base,coating);
-        if(coating.x>.0001)n=wetNormal(p,n,film,waves);
+        if(coating.x>.0001 && !submerged)n=wetNormal(p,n,film,waves);
     }
+    // Soaked open-grain wood loses its diffuse backscatter (index matching):
+    // a spill reads as dark liquid, not clear cellophane over dry planks.
+    if(submerged && mat==3)base*=.3;
     float shade=shadow(p+n*.008,l,body);
     float3 hl,head=headlight(p,u,hl);
     float3 col=base*(ambientLight(n,u[10])+keyLight(u[10])*max(0.f,dot(n,l))*shade
                      +neonFill(n,u)+head*max(0.f,dot(n,hl)));
-    float wet=smoothstep(.00008f,.0015f,coating.x);
+    float wet=submerged?0.:smoothstep(.00008f,.0015f,coating.x);
     return mix(col,environment(reflect(rd,n),u[10],u),wet*fresnelRough(dot(-rd,n),.02,.1));
 }
 float3 coffeeTransmission(float3 p,float3 n,float3 rd,float fw,float keyShade,device const float *u,
@@ -494,7 +504,9 @@ float3 coffeeTransmission(float3 p,float3 n,float3 rd,float fw,float keyShade,de
                 en=length(en)>1e-6?normalize(en):ray;
                 float3 outRay=refract(ray,-en,1.333);
                 if(length(outRay)<1e-6) {
-                    if(bounced)return radiance; // bounded multiple scattering
+                    // Bounded: a second TIR escapes along its reflection rather
+                    // than going black (black specks all over thin puddles).
+                    if(bounced)return radiance+transmission*environment(reflect(ray,en),u[10],u);
                     bounced=true;q-=ray*.020;ray=reflect(ray,en);continue;
                 }
                 ray=outRay;exited=true;
@@ -539,7 +551,7 @@ float meniscusBubbles(float3 p,thread float3 &n,float fw,CupBody body) {
     if(best<1. && detail>0.) {
         float3 tangent=normalize(float3(-q.z,0,q.x)),radial=normalize(float3(q.x,0,q.z));
         float3 bn=offset.x*tangent-offset.y*radial+sqrt(max(0.f,1.-best*best))*float3(0,1,0);
-        n=normalize(mix(n,rotateQ(body.rotation,bn),detail));
+        n=normalize(mix(n,rotateQ(body.rotation,bn),.4*detail)); // domes: glints, not glitter
         return .3*detail;
     }
     return band*.12*(1.-detail);
