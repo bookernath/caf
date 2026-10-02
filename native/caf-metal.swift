@@ -32,7 +32,7 @@ do {
     let detailURL = shaderURL.deletingLastPathComponent().appendingPathComponent("caf-detail.metal")
     let source = try "#define CAF_SCENE_LAYOUT 5\n" + String(contentsOf: sceneURL, encoding: .utf8) + "\n" + String(contentsOf: shaderURL, encoding: .utf8) + "\n" + String(contentsOf: fluidURL, encoding: .utf8) + "\n" + String(contentsOf: detailURL, encoding: .utf8)
     let library = try device.makeLibrary(source: source, options: nil)
-    for name in ["coffee", "fluidClear", "fluidBins", "fluidP2G", "fluidForces", "fluidDivergence",
+    for name in ["coffeePrep", "coffee", "coffeeEdges", "coffeeResolve", "fluidClear", "fluidBins", "fluidP2G", "fluidForces", "fluidDivergence",
                  "fluidPressure", "fluidProject", "fluidG2P", "fluidEvents", "fluidSurface", "fluidStats", "fluidGridStats", "cupEvents", "cupStep", "fluidReaction", "fluidBreakup", "filmGather", "filmFlux", "filmAdvance", "filmCommit", "filmStats"] {
         guard let function = library.makeFunction(name: name) else { fail("missing kernel \(name)") }
         pipelines[name] = try device.makeComputePipelineState(function: function)
@@ -263,6 +263,10 @@ final class Fluid {
 }
 FileHandle.standardOutput.write(Data("CAF_METAL_5\n".utf8))
 var output: MTLBuffer?, outputSize=0
+// Temporal AA: linear radiance + (depth, material) for this frame, persistent
+// history (rgb, sample count) + previous (depth, material), and pass state.
+var renderTargets: [MTLBuffer] = [], renderPixels = 0
+guard let renderState=device.makeBuffer(length:128,options:.storageModePrivate) else {fail("render state")}
 var fluid: Fluid?
 guard let restingBody=device.makeBuffer(length:80,options:.storageModeShared) else {fail("body buffer")}
 memset(restingBody.contents(),0,80)
@@ -283,7 +287,20 @@ while let line=readLine() {
         if enabled && fluid==nil {fluid=Fluid(level:u[3],device:device)}
         if enabled {u[33]=Float((fluid!.metadata["surface_height"] as? NSNumber)?.floatValue ?? 0.9)}
         if size != outputSize {output=device.makeBuffer(length:size,options:.storageModeShared);outputSize=size}
+        let exposure=(frame["exposure"] as? NSNumber)?.floatValue ?? 1
+        u += [exposure.isFinite ? max(0,min(16,exposure)) : 1, 0, 0, 0]
         guard let command=queue.makeCommandBuffer() else {fail("command allocation")}
+        if shouldRender && width*height != renderPixels {
+            // Fresh zeroed history has sample count 0, so it is never blended.
+            renderTargets=[16,8,16,8].map {stride in
+                guard let buffer=device.makeBuffer(length:width*height*stride,options:.storageModePrivate) else {fail("render targets")}
+                return buffer
+            }
+            renderPixels=width*height
+            guard let blit=command.makeBlitCommandEncoder() else {fail("render clear")}
+            for buffer in renderTargets {blit.fill(buffer:buffer,range:0..<buffer.length,value:0)}
+            blit.fill(buffer:renderState,range:0..<renderState.length,value:0);blit.endEncoding()
+        }
         if enabled {
             guard let settings=frame["fluid"] as? [String:Any] else {fail("missing fluid settings")}
             fluid!.encode(settings,u,render:shouldRender,command:command)
@@ -296,8 +313,6 @@ while let line=readLine() {
                   let particles=device.makeBuffer(bytes:dots.isEmpty ? [Float](repeating:0,count:4):dots,
                                                    length:max(4,dots.count)*4,options:.storageModeShared),
                   let encoder=command.makeComputeCommandEncoder() else {fail("render allocation")}
-            let pipeline=pipelines["coffee"]!
-            encoder.setComputePipelineState(pipeline)
             encoder.setBuffer(target,offset:0,index:0);encoder.setBuffer(uniforms,offset:0,index:1)
             encoder.setBuffer(enabled ? fluid!.buffers[11]:waves,offset:0,index:2)
             encoder.setBuffer(particles,offset:0,index:3)
@@ -306,8 +321,20 @@ while let line=readLine() {
             for (index,source) in [(5,0),(6,1),(7,2),(8,3),(9,18),(10,20),(11,22),(12,24)] {
                 encoder.setBuffer(enabled ? fluid!.buffers[source]:restingBody,offset:0,index:index)
             }
-            let x=pipeline.threadExecutionWidth,y=min(8,pipeline.maxTotalThreadsPerThreadgroup/x)
-            encoder.dispatchThreads(MTLSize(width:width,height:height,depth:1),threadsPerThreadgroup:MTLSize(width:x,height:y,depth:1))
+            // prep (1 thread) -> jittered trace -> edge supersample -> temporal resolve + output.
+            for (index,buffer) in [(13,renderTargets[0]),(14,renderTargets[1]),(15,renderTargets[2]),
+                                   (16,renderTargets[3]),(17,renderState)] {encoder.setBuffer(buffer,offset:0,index:index)}
+            for name in ["coffeePrep","coffee","coffeeEdges","coffeeResolve"] {
+                let pipeline=pipelines[name]!
+                encoder.setComputePipelineState(pipeline)
+                if name=="coffeePrep" {
+                    encoder.dispatchThreads(MTLSize(width:1,height:1,depth:1),threadsPerThreadgroup:MTLSize(width:1,height:1,depth:1))
+                } else {
+                    let x=pipeline.threadExecutionWidth,y=min(8,pipeline.maxTotalThreadsPerThreadgroup/x)
+                    encoder.dispatchThreads(MTLSize(width:width,height:height,depth:1),threadsPerThreadgroup:MTLSize(width:x,height:y,depth:1))
+                }
+                encoder.memoryBarrier(scope:.buffers)
+            }
             encoder.endEncoding()
         }
         command.commit();command.waitUntilCompleted()
