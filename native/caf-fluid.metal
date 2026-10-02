@@ -650,13 +650,15 @@ kernel void fluidG2P(device FluidParticle *particles [[buffer(0)]],device const 
     if(touchedFixed)depositFilm(p,fixedImpact,film,pending,details);
     if(!inGrid(particleCell(p.x.xyz)))p.cz.w=1.; // off-scene, accounted, never respawned
     // Advected material concentration is carried by equal-mass particles.
-    // A small PIC scalar blend models diffusion without changing fluid forces.
+    // A PIC scalar blend models sub-grid (turbulent) mixing without changing
+    // fluid forces: single-particle cream specks dissolve in ~3 s, while
+    // ribbons wider than a cell survive until stirring thins them.
     float milk=0.,totalMilk=0.;int3 dyeBase=int3(floor(gx-1.));
     for(int z=0;z<3;z++)for(int y=0;y<3;y++)for(int x=0;x<3;x++) {
         int3 c=dyeBase+int3(x,y,z);if(!inGrid(c))continue;
         float w=weight(float3(c)+.5-gx);milk+=w*cream[cellIndex(c)];totalMilk+=w;
     }
-    float concentration=!ballistic && totalMilk>1e-6?mix(p.v.w,milk/totalMilk,1.-exp(-s[0]*.12)):p.v.w;
+    float concentration=!ballistic && totalMilk>1e-6?mix(p.v.w,milk/totalMilk,1.-exp(-s[0]*.35)):p.v.w;
     p.v=float4(vel,clamp(concentration,0.f,1.f));
     p.cx=float4(clamp(affine[0],-100.f,100.f),p.cx.w);
     p.cy=float4(clamp(affine[1],-100.f,100.f),p.cy.w);
@@ -770,7 +772,7 @@ kernel void fluidSurface(device const FluidParticle *particles [[buffer(0)]],dev
             totalRadius+=e.z*w;
             center+=delta*w;diagonal+=delta*delta*w;
             off+=float3(delta.x*delta.y,delta.x*delta.z,delta.y*delta.z)*w;
-            float mw=1.-r2/(.06*.06);mw=mw>0.?mw*mw*mw*a.w:0.;
+            float mw=1.-r2/(.08*.08);mw=mw>0.?mw*mw*mw*a.w:0.;
             milk+=e.w*mw;milkWeight+=mw;coarseMilk+=e.w*w;total+=w;
         }
     }
@@ -790,23 +792,64 @@ kernel void fluidSurface(device const FluidParticle *particles [[buffer(0)]],dev
     float concentration=milkWeight>1e-6?milk/milkWeight:(total>1e-6?coarseMilk/total:0.);
     field[i]=float4(field[i].x,concentration,total,clamp(phi,-.1f,.12f));
 }
+// Upward-facing (height-field) surface: a wide horizontal Gaussian of the raw
+// distance. For phi = y - h(x,z) it low-passes h exactly, removing the
+// particle-scale bumps a stirred (disordered) particle set leaves (~1 DX),
+// which no 6-neighbour pass can, while sloshing waves (>10 DX) pass intact.
+// Inside the ceramic there are no particles, so phi reads as air there: those
+// samples are skipped, and voxels just inside a wall take the liquid side's
+// horizontal extrapolation, so the meniscus meets the glaze without curling
+// down into a bright, crinkled ring of wall reflections.
+constant float HEIGHT_SIGMA=2.5; // surface voxels (~.6 DX)
+float horizontalBlur(int3 fine,bool nearWall,device const float4 *field,CupBody body,thread float &total) {
+    float blur=0.;total=0.;
+    for(int dz=-4;dz<=4;dz+=2)for(int dx=-4;dx<=4;dx+=2) {
+        int3 q=int3(clamp(fine.x+dx,0,SURFACE.x-1),fine.y,clamp(fine.z+dz,0,SURFACE.z-1));
+        if(nearWall && solidDistance(ORIGIN+(float3(q)+.5)*SURFACE_DX,body)<.5*SURFACE_DX)continue;
+        float w=exp(-float(dx*dx+dz*dz)/(2.*HEIGHT_SIGMA*HEIGHT_SIGMA));
+        blur+=w*field[(q.z*SURFACE.y+q.y)*SURFACE.x+q.x].w;total+=w;
+    }
+    return total>0.?blur/total:0.;
+}
 // One band-limited Laplacian pass (|change| <= half a voxel, so sheets thin
 // but do not tear), then motion-adaptive temporal blending with the previous
 // frame: sub-voxel jitter is averaged away, real motion passes straight through.
 kernel void fluidSurfaceSmooth(device float4 *field [[buffer(11)]],device const uint *active [[buffer(3)]],
-                               device const float *s [[buffer(10)]],uint i [[thread_position_in_grid]]) {
+                               device const float *s [[buffer(10)]],device const CupBody &body [[buffer(14)]],
+                               uint i [[thread_position_in_grid]]) {
     if(i>=uint(SURFACE.x*SURFACE.y*SURFACE.z))return;
     int3 fine=int3(i%SURFACE.x,(i/SURFACE.x)%SURFACE.y,i/(SURFACE.x*SURFACE.y));
-    int3 c=particleCell(ORIGIN+(float3(fine)+.5)*SURFACE_DX);
+    float3 x=ORIGIN+(float3(fine)+.5)*SURFACE_DX;int3 c=particleCell(x);
     if(!inGrid(c)||!active[cellIndex(c)])return; // fluidSurface already wrote .12
     float raw=field[i].w,phi=raw;
     if(abs(raw)<3.*SURFACE_DX) {
-        float sum=0.;
-        for(int a=0;a<3;a++)for(int direction=-1;direction<=1;direction+=2) {
-            int3 q=fine;q[a]=clamp(q[a]+direction,0,SURFACE[a]-1);
-            sum+=field[(q.z*SURFACE.y+q.y)*SURFACE.x+q.x].w;
+        float wall=solidDistance(x,body);bool nearWall=wall<6.*SURFACE_DX;
+        if(wall<.5*SURFACE_DX) {
+            float total,blur=horizontalBlur(fine,true,field,body,total);
+            if(total>.05)phi=blur;
+        } else {
+            float sum=0.;float3 g;
+            for(int a=0;a<3;a++) {
+                float side[2];
+                for(int k=0;k<2;k++) {
+                    int3 q=fine;q[a]=clamp(q[a]+2*k-1,0,SURFACE[a]-1);
+                    bool solid=nearWall && solidDistance(ORIGIN+(float3(q)+.5)*SURFACE_DX,body)<.5*SURFACE_DX;
+                    side[k]=solid?raw:field[(q.z*SURFACE.y+q.y)*SURFACE.x+q.x].w;sum+=side[k];
+                }
+                g[a]=side[1]-side[0];
+            }
+            float laplacian=clamp(.5*(sum/6.-raw),-.5f*SURFACE_DX,.5f*SURFACE_DX);
+            float up=smoothstep(.55f,.85f,g.y/max(length(g),1e-6f));
+            // Spills on the table/saucer are a particle or two thick: blur
+            // them flat whatever the normal, filling pinholes between the
+            // particles and softening the outline instead of beading it.
+            up=max(up,1.-smoothstep(3.f*SURFACE_DX,5.f*SURFACE_DX,fixedSolid(x)));
+            if(up>0.) {
+                float total,height=clamp(horizontalBlur(fine,nearWall,field,body,total)-raw,-1.5f*SURFACE_DX,1.5f*SURFACE_DX);
+                laplacian=mix(laplacian,height,up);
+            }
+            phi+=laplacian;
         }
-        phi+=clamp(.5*(sum/6.-raw),-.5f*SURFACE_DX,.5f*SURFACE_DX);
     }
     if(s[24]>0.) {
         float old=field[i].x,change=abs(phi-old);

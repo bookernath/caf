@@ -121,7 +121,13 @@ The free surface now uses a finer **224×128×224 covariance-aware reconstructio
 over anisotropic (Yu–Turk) particle kernels: a particle's neighbour covariance
 narrows its kernel across airborne sheets, centres are Laplacian-smoothed, and one
 band-limited smoothing pass plus motion-adaptive blending with the previous frame
-remove particle-scale crumpling and flicker without lagging real motion. Thin
+remove particle-scale crumpling and flicker without lagging real motion. After a
+stir the particles are disordered and leave ~1-cell bumps that read as crinkled
+foil, so upward-facing (height-field) surfaces and table/saucer spills also get a
+wide horizontal Gaussian of the distance (σ ≈ 0.6 cells, bounded change): for
+φ = y − h(x,z) it low-passes h exactly, keeping sloshing waves and splashes. Voxels
+inside the ceramic take the liquid side's horizontal extrapolation, so the
+meniscus meets the glaze cleanly instead of curling into a bright crinkled ring. Thin
 sheets, bounded surface-tension forces and short-range rim adhesion remain. Density-drift
 correction prevents particle bunching from silently shrinking the visible liquid.
 The underlying pressure grid remains 56×32×56; this is still a finite-resolution
@@ -170,11 +176,17 @@ film-geometry solver, and drying time is intentionally accelerated.
 refracted ray samples actual liquid thickness, RGB absorption, and ceramic/table
 behind it: deep coffee is dark; thin spills transmit amber light. Fresnel reflection
 remains at the surface. There is no procedural cream-colored pattern in APIC mode;
-only added cream scatters light. This is a real-time single-path approximation,
+only added cream scatters light. Under a spill the soaked wood loses its diffuse
+backscatter (darkens) and the film has no air-interface mirror of its own, so a
+puddle reads as dark glossy liquid rather than cellophane. This is a real-time single-path approximation,
 not a full multiple-scattering/path-traced renderer.
 
 **Cream is transported, not painted.** A small moving pour adds cream-bearing
-particles. Concentration follows the flow with gentle diffusion. Cold cream is
+particles. Concentration follows the flow; a sub-grid mixing term dissolves
+single-particle specks within seconds while ribbons wider than a cell persist
+until stirring thins them. Cream scatters ~300/unit (10 cm) at full
+concentration, so even a ~6% splash out-scatters the coffee's absorption and
+turns the cup visibly tan. Cold cream is
 modelled ~2.5% denser than hot coffee, so the pour plunges and spreads low until
 stirring lifts it. Stirring is a submerged spoon circling the cup plus a weak bulk
 swirl, with vorticity confinement and wall skin friction, so it sheds shear
