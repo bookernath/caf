@@ -58,7 +58,6 @@ caf-lid-guard so closing the lid doesn't sleep the machine out from under a
 long-running job (assertions alone can't stop lid-close sleep).
 """
 
-import base64
 import math
 import os
 import random
@@ -71,11 +70,12 @@ import subprocess
 import sys
 import threading
 import time
-import zlib
 
 from caf_motion import (SensorSamples, basis_for_rest, calibration_wizard,
                         load_calibration)
-from caf_graphics import MetalRenderer, dimensions, probe_terminal, rgb_png
+from caf_graphics import (DEFAULT_CELL, PNG_LIMIT, SHM_LIMIT, MetalRenderer, cell_pixels,
+                          dimensions, kitty_frame, kitty_png, probe_graphics,
+                          rgb_png)
 
 # --------------------------------------------------------------------------
 # Themes
@@ -2373,29 +2373,8 @@ class Scene:
 # Kitty graphics output (--hires)
 # --------------------------------------------------------------------------
 
-def encode_png(w, h, rows):
-    """rows: list of bytes objects, each 3*w RGB bytes."""
-    def chunk(tag, data):
-        c = tag + data
-        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c))
-    raw = b"".join(b"\x00" + r for r in rows)
-    return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(raw, 6))
-            + chunk(b"IEND", b""))
-
-
-def kitty_emit(png, cols, rows_cells):
-    b64 = base64.standard_b64encode(png).decode()
-    parts = ["\x1b[H"]
-    step = 4096
-    for i in range(0, len(b64), step):
-        last = i + step >= len(b64)
-        ctl = f"m={0 if last else 1}"
-        if i == 0:
-            ctl = f"a=T,f=100,i=99,p=1,q=2,c={cols},r={rows_cells}," + ctl
-        parts.append(f"\x1b_G{ctl};{b64[i:i + step]}\x1b\\")
-    return "".join(parts)
+# Encoding and Kitty escapes live in caf_graphics (kitty_png/kitty_shm).
+kitty_emit = kitty_png
 
 
 def px_to_png(px, W, H):
@@ -2406,7 +2385,7 @@ def px_to_png(px, W, H):
         for c in px[y]:
             row += bytes(c) if c is not None else bgb
         rows.append(bytes(row))
-    return encode_png(W, H, rows)
+    return rgb_png(W, H, b"".join(rows))
 
 
 # --------------------------------------------------------------------------
@@ -2447,6 +2426,9 @@ def usage():
     print("      --cup free|locked: mobile cup (default) or fixed; --studio: static lighting")
     print("      --fluid apic|legacy: real GPU spills (default) or old surface; f refills, r resets")
     print("      --ansi: force character output; --smooth: disable fine GPU dithering")
+    print("      --transport auto|png|shm: GPU frames via shared memory (local kitty-")
+    print("      protocol terminals that confirm t=s) or PNG; env CAF_TRANSPORT, and")
+    print("      CAF_PIPELINE=auto|on|off overlaps GPU work with frame output")
     print("\x1b[1mMode:\x1b[0m the ray-marched cup is the default; --2d gives the half-block")
     print("     scene, which is cheaper and retains its original rigid-body physics.")
     print("\x1b[1mThemes file:\x1b[0m ~/.config/caf/themes.toml")
@@ -2474,6 +2456,8 @@ def main():
     no_lid_guard = False
     preset = "diner"
     renderer_mode = "auto"
+    transport_mode = os.environ.get("CAF_TRANSPORT", "auto")
+    pipeline_mode = os.environ.get("CAF_PIPELINE", "auto")
     fluid_mode = "apic"
     cup_motion = True
     cinematic = True
@@ -2512,6 +2496,11 @@ def main():
                 print("caf: --renderer expects auto, metal, or cpu", file=sys.stderr)
                 return 2
             renderer_mode = args[i+1]; i += 1
+        elif a == "--transport":
+            if i+1 >= len(args) or args[i+1] not in ("auto", "png", "shm"):
+                print("caf: --transport expects auto, png, or shm", file=sys.stderr)
+                return 2
+            transport_mode = args[i+1]; i += 1
         elif a == "--fluid":
             if i+1 >= len(args) or args[i+1] not in ("apic", "legacy"):
                 print("caf: --fluid expects apic or legacy", file=sys.stderr)
@@ -2617,6 +2606,7 @@ def main():
     gpu = None
     sensors = None
     startup_input = ""
+    base_cell = DEFAULT_CELL
 
     def cleanup():
         if kit:
@@ -2652,9 +2642,15 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
 
     try:
-        supported = False
+        supported = shm_ok = False
+        if transport_mode not in ("auto", "png", "shm"):
+            transport_mode = "auto"
         if not ansi and interactive:
-            supported, startup_input = probe_terminal(sys.stdin, sys.stdout)
+            probe = probe_graphics(
+                sys.stdin, sys.stdout,
+                shm=transport_mode == "auto" and three_d and renderer_mode != "cpu")
+            supported, startup_input, base_cell = probe.images, probe.pending, probe.cell
+            shm_ok = probe.shm
         elif not ansi and demo_frames:
             supported = hires or renderer_mode == "metal"
         wants_gpu = three_d and renderer_mode != "cpu" and not ansi and supported
@@ -2662,6 +2658,10 @@ def main():
             try:
                 gpu = MetalRenderer()
                 scene.real_fluid = fluid_mode == "apic"
+                gpu.transport = ("shm" if transport_mode == "shm"
+                                 or (transport_mode == "auto" and shm_ok) else "png")
+                gpu.pipeline = (pipeline_mode if pipeline_mode in ("on", "off")
+                                else "auto")
             except OSError as exc:
                 if renderer_mode == "metal":
                     print(f"caf: {exc}; using CPU renderer", file=sys.stderr)
@@ -2919,11 +2919,17 @@ def main():
                 scene.t += 1/30
                 scene.step(1/30)
                 sim_accumulator -= 1/30
-            png = None
+            image = None
             if gpu:
                 try:
-                    gw, gh = dimensions(cols, rows)
-                    png = rgb_png(gw, gh, gpu.render(scene, gw, gh, dither))
+                    # Native pixels: the kernel's live cell size tracks font
+                    # zoom; the probe's CSI 16t answer is the fallback.
+                    cell = (interactive and cell_pixels(sys.stdout.fileno())) or base_cell
+                    gw, gh = dimensions(cols, rows, cell, SHM_LIMIT
+                                        if getattr(gpu, "transport", "") == "shm"
+                                        else PNG_LIMIT)
+                    image = kitty_frame(gpu.render(scene, gw, gh, dither),
+                                        gw, gh, cols, rows - 1)
                 except (OSError, ValueError):
                     gpu.close()
                     gpu = None
@@ -2936,14 +2942,14 @@ def main():
                     scene.layout(cols, rows)
                     sys.stdout.write("\x1b_Ga=d,d=I,i=99,q=2;\x1b\\\x1b[2J")
                     extra += " · GPU stopped; CPU fallback"
-            if png is None:
+            if image is None:
                 px, sgrid = scene.draw()
             status = scene.status(now - start, keyboard, extra, zen, width=cols)
 
-            if png is not None or S:
-                if png is None:
-                    png = px_to_png(px, scene.W, scene.H)
-                buf = kitty_emit(png, cols, rows - 1)
+            if image is not None or S:
+                if image is None:
+                    image = kitty_emit(px_to_png(px, scene.W, scene.H), cols, rows - 1)
+                buf = image
                 if status != prev_status:
                     buf += f"\x1b[{rows};1H\x1b[2K{status}"
                 prev_status = status
@@ -2964,6 +2970,8 @@ def main():
                 prev_sparkle_rows = {r for _, r, _ in scene.sparkles}
             sys.stdout.write(buf)
             sys.stdout.flush()
+            if gpu and hasattr(gpu, "note_frame"):
+                gpu.note_frame(time.monotonic() - now, frame_budget)
 
             frame_n += 1
             if demo_frames and frame_n >= demo_frames:

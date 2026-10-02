@@ -120,7 +120,9 @@ raise SystemExit(g['main']())
                 stdout=slave,
                 stderr=slave,
                 cwd=ROOT,
-                env=dict(os.environ, TERM="xterm-256color"),
+                # Pinned serial: the pause assertions compare each frame's own
+                # stats, which pipelining (auto under GPU load) shifts by one.
+                env=dict(os.environ, TERM="xterm-256color", CAF_PIPELINE="off"),
             )
             os.close(slave)
             output = bytearray()
