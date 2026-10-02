@@ -472,19 +472,19 @@ float3 coffeeTransmission(float3 p,float3 n,float3 rd,float fw,float keyShade,de
     float3 coffeeAbsorb=coffeeAbsorption(u);
     float3 light=keyDir();
     // Cream in-scattering: key through the surface plus the cool sky dome.
-    float3 illumination=ambientLight(float3(0,1,0),u[10])*1.5+keyLight(u[10])*.45*max(0.f,dot(n,light))*keyShade;
+    float3 illumination=ambientLight(float3(0,1,0),u[10])*1.5+keyLight(u[10])*.8*max(0.f,dot(n,light))*keyShade;
     for(int j=0;j<112;j++) {
         float2 ceramic=crockery(q,body);
         if(q.y+.13<ceramic.x)ceramic=float2(q.y+.13,3);
         if(ceramic.x<.0015)
-            return radiance+transmission*transmittedSolid(q,int(ceramic.y),ray,fw,u,body,film,dry,waves);
+            return radiance+transmission*transmittedSolid(q,int(ceramic.y),ray,fw,u,body,film,dry,waves,!exited);
         float4 sample=fluidSample(q,field);
         if(!exited && sample.x<.0015) {
             entered=true;
             float step=min(.018f,max(.003f,ceramic.x*.8));
             float cream=clamp(sample.y,0.f,1.f);
             float3 absorb=coffeeAbsorb*(1.-cream);
-            float3 scatter=float3(32.)*cream;
+            float3 scatter=float3(CREAM_SCATTER)*cream;
             float3 extinction=absorb+scatter+1e-5;
             float3 attenuation=exp(-extinction*step);
             // Cream in-scattering is seen through a softened coffee absorption,
@@ -687,7 +687,7 @@ float3 shadeSpray(float3 p,float3 rd,SprayHit hit,float fp,device const float *u
         if(h.x<.002) {background=shadeHit(q,ray,int(h.y),fp,u,field,body,film,dry,waves,impacts);break;}
         t+=max(.003f,h.x*.75);if(t>5.)break;
     }
-    float3 absorb=coffeeAbsorption(u)*(1.-hit.cream),scatter=32.*hit.cream;
+    float3 absorb=coffeeAbsorption(u)*(1.-hit.cream),scatter=CREAM_SCATTER*hit.cream;
     float3 extinction=absorb+scatter+1e-5,transmission=exp(-extinction*thickness);
     float3 col=background*transmission+(1.-transmission)*multipleScatter(scatter/extinction)*float3(.60,.55,.45);
     col=mix(col,environment(reflect(rd,n),u[10],u),fresnelRough(dot(-rd,n),.02,0.));

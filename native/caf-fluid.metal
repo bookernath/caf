@@ -650,13 +650,15 @@ kernel void fluidG2P(device FluidParticle *particles [[buffer(0)]],device const 
     if(touchedFixed)depositFilm(p,fixedImpact,film,pending,details);
     if(!inGrid(particleCell(p.x.xyz)))p.cz.w=1.; // off-scene, accounted, never respawned
     // Advected material concentration is carried by equal-mass particles.
-    // A small PIC scalar blend models diffusion without changing fluid forces.
+    // A PIC scalar blend models sub-grid (turbulent) mixing without changing
+    // fluid forces: single-particle cream specks dissolve in ~3 s, while
+    // ribbons wider than a cell survive until stirring thins them.
     float milk=0.,totalMilk=0.;int3 dyeBase=int3(floor(gx-1.));
     for(int z=0;z<3;z++)for(int y=0;y<3;y++)for(int x=0;x<3;x++) {
         int3 c=dyeBase+int3(x,y,z);if(!inGrid(c))continue;
         float w=weight(float3(c)+.5-gx);milk+=w*cream[cellIndex(c)];totalMilk+=w;
     }
-    float concentration=!ballistic && totalMilk>1e-6?mix(p.v.w,milk/totalMilk,1.-exp(-s[0]*.12)):p.v.w;
+    float concentration=!ballistic && totalMilk>1e-6?mix(p.v.w,milk/totalMilk,1.-exp(-s[0]*.35)):p.v.w;
     p.v=float4(vel,clamp(concentration,0.f,1.f));
     p.cx=float4(clamp(affine[0],-100.f,100.f),p.cx.w);
     p.cy=float4(clamp(affine[1],-100.f,100.f),p.cy.w);
@@ -770,7 +772,7 @@ kernel void fluidSurface(device const FluidParticle *particles [[buffer(0)]],dev
             totalRadius+=e.z*w;
             center+=delta*w;diagonal+=delta*delta*w;
             off+=float3(delta.x*delta.y,delta.x*delta.z,delta.y*delta.z)*w;
-            float mw=1.-r2/(.06*.06);mw=mw>0.?mw*mw*mw*a.w:0.;
+            float mw=1.-r2/(.08*.08);mw=mw>0.?mw*mw*mw*a.w:0.;
             milk+=e.w*mw;milkWeight+=mw;coarseMilk+=e.w*w;total+=w;
         }
     }
