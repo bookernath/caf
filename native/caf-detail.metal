@@ -203,15 +203,20 @@ kernel void filmStats(device const uint4 *film [[buffer(18)]],device const uint4
 
 float4 sampleFilm(float2 xz,device const uint4 *film,device const uint4 *dry) {
     float2 g=(xz-FILM_ORIGIN)/FILM_DX-.5;int2 c=int2(floor(g));float2 f=fract(g);
-    float4 sample=0.;
+    float4 sample=0.;float footprint=0.;
     for(int y=0;y<2;y++)for(int x=0;x<2;x++) {
         int2 n=c+int2(x,y);if(!inFilm(n))continue;
         int i=filmIndex(n);float w=(x?f.x:1.-f.x)*(y?f.y:1.-f.y);
         uint4 a=film[i],b=dry[i];
         sample+=float4(filmDepth(a.x),float(a.y+b.x),float(a.z+b.y),float(b.x+b.y))*w;
+        footprint+=(a.w&0x80000000u)?w:0.;
     }
     // yz are areal tracer load in particle-equivalent thickness units.
     sample.yzw*=FILM_VOLUME_Q/(FILM_DX*FILM_DX);
+    // Render-side coffee ring: residue is darker where the ever-wet footprint
+    // ends (the same perimeter filmStats counts), as pinned pigment piles up.
+    float ring=4.*footprint*(1.-footprint);
+    sample.w*=1.+1.8*ring*ring;
     return sample;
 }
 float2 wetHeight(int2 c,device const uint4 *film,device const float2 *ripples) {
@@ -232,8 +237,9 @@ float3 wetNormal(float3 p,float3 n,device const uint4 *film,device const float2 
         depth+=w*h[y][x].x;
     }
     slope/=2.*FILM_DX;
-    // xy: depth slope (meniscus at the wet edge), zw: low-passed ripple slope.
-    float2 meniscus=clamp(slope.xy*.35,-.22f,.22f),ripple=clamp(slope.zw*.30,-.10f,.10f);
+    // xy: depth slope (a rounded meniscus that catches a bright edge
+    // highlight at the wet boundary), zw: low-passed ripple slope.
+    float2 meniscus=clamp(slope.xy*.5,-.3f,.3f),ripple=clamp(slope.zw*.30,-.10f,.10f);
     float2 gradient=(meniscus+ripple)*smoothstep(.00005f,.0012f,depth);
     return normalize(n-float3(gradient.x,0,gradient.y));
 }
@@ -261,12 +267,13 @@ float3 fluidGradient(float3 p,device const float *raw) {
     }
     return gradient/SURFACE_DX;
 }
+// Pigment absorbs by Beer-Lambert over the double pass down and back, so thin
+// films and light residue are tan while deep pools approach near-black.
 float3 stainColor(float3 base,float4 sample) {
     float share=sample.y/max(1e-8f,sample.y+sample.z);
-    float coffee=1.-exp(-(sample.y+sample.w*share*5.)*110.);
+    float load=sample.y+sample.w*share*4.;
+    float3 stained=base*exp(-float3(55.,105.,190.)*2.*load);
     float cream=1.-exp(-(sample.z+sample.w*(1.-share)*3.)*100.);
-    float dry=1.-smoothstep(.00015f,.002f,sample.x);
-    float3 stained=base*mix(float3(1),float3(.40,.19,.08),coffee*(.55+.35*dry));
     return mix(stained,float3(.48,.36,.21),cream*.55);
 }
 
