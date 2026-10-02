@@ -684,7 +684,7 @@ kernel void fluidEvents(device FluidParticle *particles [[buffer(0)]],device con
 }
 // Anisotropic (Yu-Turk) surface kernels. Per particle: neighbour covariance ->
 // principal axes; the kernel keeps its in-plane radius but narrows across
-// sheets (to half), so a spill sheet is averaged along its plane rather than
+// airborne sheets, so a spill sheet is averaged along its plane rather than
 // following every particle's bump. Centres are Laplacian-smoothed toward the
 // neighbour mean (bounded shift), which removes per-particle jitter. Written
 // into the solver buffer, dead between substeps: 3 float4 per slot.
@@ -728,13 +728,19 @@ kernel void fluidAnisotropy(device const FluidParticle *particles [[buffer(0)]],
             float3x3 covariance=outer*(1./total)-float3x3(mean*mean.x,mean*mean.y,mean*mean.z);
             float3 e;eigenSymmetric(covariance,e,axes);
             float3 sigma=sqrt(max(e,float3(1e-12)));
-            radii=KERNEL_RADIUS*clamp(sigma/max(sigma.x,max(sigma.y,sigma.z)),.5f,1.f);
+            // Only genuinely planar, airborne neighbourhoods (pour sheets):
+            // narrowing the bulk surface or a table puddle (half-space
+            // neighbourhoods) only roughens it or opens holes.
+            float3 ratio=sigma/max(sigma.x,max(sigma.y,sigma.z));
+            if(min(ratio.x,min(ratio.y,ratio.z))<.45 && fixedSolid(p.x.xyz)>.05)radii=KERNEL_RADIUS*clamp(ratio,.6f,1.f);
         }
     }
     // G = R diag(1/r) R^T (symmetric): kernel argument s = |G (x - centre)|.
     float3x3 g=axes*float3x3(float3(1./radii.x,0,0),float3(0,1./radii.y,0),float3(0,0,1./radii.z))*transpose(axes);
     // Everything fluidSurface needs, so its gather never touches the particles.
-    solver[3*i]=float4(centre,particleWeight(p));
+    // Weight scaled by the kernel's volume ratio, so a narrowed kernel still
+    // carries its particle's full share into the sheet-thickness heuristics.
+    solver[3*i]=float4(centre,particleWeight(p)*KERNEL_RADIUS*KERNEL_RADIUS*KERNEL_RADIUS/(radii.x*radii.y*radii.z));
     solver[3*i+1]=float4(g[0][0],g[1][1],g[2][2],g[1][0]);
     solver[3*i+2]=float4(g[2][0],g[2][1],particleRadius(p),p.v.w);
 }
