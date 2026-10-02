@@ -22,11 +22,31 @@ terminal names alone are not treated as proof of image support.
 - Fine, stable ordered dithering (`--smooth` disables it), not low-resolution upscaling.
 - Ambient light changes the warm/cool lighting balance. The camera rests by default;
   press `o` for auto-orbit.
-- Bounded 30 FPS target, up to 960×720 real pixels. Sensor samples are buffered
-  independently of rendering. At 720×480 on the development Mac, the warm APIC +
-  rendering + readback/IPC + PNG pipeline measured **19.2 ms median / 20.5 ms p95**
-  over 320 warm frames covering cream, stirring and a cup knock-over. Terminal transport, decoding and
-  display are excluded; this is not a guaranteed end-to-end frame rate.
+- Native resolution: the image is rendered at the terminal's real cell pixel size
+  (`TIOCGWINSZ`, else a CSI 16t/14t answer, else 6×12), so nothing is rescaled.
+- Zero-copy frames: when the terminal also confirms Kitty shared-memory images
+  (`t=s`, probed in the same round trip; never over SSH), the GPU renders straight
+  into a fresh POSIX shm object per frame which the terminal reads and unlinks —
+  no PNG, no base64 of pixels, no pipe copy. Up to 1.6 Mpx (2560×1600 box) this way;
+  otherwise a parallel-deflate PNG is sent, capped at 960×720. Unread objects are
+  reaped after 16 frames and on exit. `--transport png|shm` (or `CAF_TRANSPORT`)
+  forces either path.
+- Bounded 30 FPS target. When a frame would miss its budget, the GPU renders frame
+  N+1 while frame N is encoded and written (one frame of extra latency; stats lag one
+  frame); `CAF_PIPELINE=on|off` overrides. Sensor samples are buffered independently
+  of rendering. On the development Mac (M5 Max), warm APIC + rendering + IPC + encode
+  to the final Kitty escape over 320 frames of cream, stirring and a knock-over,
+  median / p95 ms:
+
+  | frame | PNG | shm | PNG, pipelined | shm, pipelined |
+  |---|---|---|---|---|
+  | 720×480 | 16.6 / 18.4 | 14.0 / 15.2 | 14.0 / 19.0 | 13.7 / 15.2 |
+  | 960×720 | 20.0 / 21.8 | 15.4 / 16.3 | 15.2 / 16.8 | 15.2 / 16.6 |
+  | 1440×960 | 27.0 / 29.8 | 17.4 / 18.2 | 20.2 / 21.7 | 17.2 / 18.2 |
+
+  (The previous serial PNG path measured 19.8 / 20.8 at 720×480.) GPU time is
+  ~12.5 ms at 720×480 and ~16–18 ms at 1440×960, mostly the fluid solve. Terminal
+  decoding and display are excluded; this is not a guaranteed end-to-end frame rate.
 - Missing helper, unavailable GPU, unsupported terminal or a failed render falls back
   to the CPU path. `--ansi` explicitly disables images; `--renderer cpu` disables Metal.
 
@@ -291,6 +311,7 @@ caf-art [preset] [flags]      # ray-marched 3D cup by default
 | `--weather` | fetch local weather once (wttr.in): rain streaks, drifting snow, or a warm sun halo |
 | `--zen` | screensaver mode: no status line, slow theme crossfades, occasional auto-stirs |
 | `--hires` | kitty graphics protocol output (Ghostty, kitty) |
+| `--transport auto\|png\|shm` | GPU frame transport: shared memory when the terminal confirms it (default), or force one |
 | `--sound` | procedural foley through `afplay` (macOS) |
 
 ## Custom themes
@@ -394,6 +415,8 @@ python3 -B tools/cinematic_probe.py --action mix --frames 330 --render-every 30
 python3 -B tools/cinematic_probe.py --action knock --frames 300 --render-every 30
 python3 -B tools/detail_probe.py --seconds 60 --output .build/detail-probe
 python3 -B tools/fluid_benchmark.py --output .build/benchmark.json
+# Transport comparison (add --pipeline on for the overlapped loop):
+python3 -B tools/fluid_benchmark.py --size 720x480,1440x960 --transport png,shm
 ```
 
 Build the helper without installing:
@@ -409,7 +432,8 @@ APIC solver, concentration transport and particle-surface reconstruction.
 evaporation, pigment deposition, impact ripples and fine-droplet intersections.
 `native/caf-scene.metal` shares collision geometry, rigid-body state and contact
 stepping between physics and rendering. `caf_graphics.py` owns the bounded
-JSON/RGB helper protocol, color conversion and terminal capability probe;
+JSON/RGB helper protocol, shm frame transport and pipelining, color conversion and
+the terminal capability/cell-size probe;
 `caf_motion.py` owns calibration persistence and the sensor queue. The CPU renderer,
 water simulation, keyboard interactions and awake-session lifetime remain in `caf-art`.
 GPU tests need device access; sandboxed/headless runs may only have the CPU fallback.
