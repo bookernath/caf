@@ -52,10 +52,11 @@ do {
     let source = try "#define CAF_SCENE_LAYOUT 5\n" + String(contentsOf: sceneURL, encoding: .utf8) + "\n" + String(contentsOf: shaderURL, encoding: .utf8) + "\n" + String(contentsOf: fluidURL, encoding: .utf8) + "\n" + String(contentsOf: detailURL, encoding: .utf8)
     let library = try device.makeLibrary(source: source, options: nil)
     for name in ["coffeePrep", "coffee", "coffeeEdges", "coffeeResolve", "fluidClear", "fluidBins", "fluidP2G", "fluidForces", "fluidDivergence",
-                 "fluidPressure", "fluidProject", "fluidG2P", "fluidEvents", "fluidSurface", "fluidStats", "fluidGridStats", "cupEvents", "cupStep", "fluidReaction", "fluidBreakup", "filmGather", "filmFlux", "filmAdvance", "filmCommit", "filmStats"] {
+                 "fluidPressure", "fluidProject", "fluidIndirect", "fluidVorticity", "fluidExtrapolate", "fluidG2P", "fluidEvents", "fluidSurface", "fluidStats", "fluidGridStats", "cupEvents", "cupStep", "fluidReaction", "fluidBreakup", "filmGather", "filmFlux", "filmAdvance", "filmCommit", "filmStats"] {
         guard let function = library.makeFunction(name: name) else { fail("missing kernel \(name)") }
         pipelines[name] = try device.makeComputePipelineState(function: function)
     }
+    if pipelines["fluidPressure"]!.maxTotalThreadsPerThreadgroup < 128 { fail("fluidPressure needs 128-wide threadgroups") }
 } catch { fail(String(describing: error)) }
 
 final class Fluid {
@@ -64,6 +65,8 @@ final class Fluid {
     var allocated = 0, initial = 0, fullCount = 0, emitted = 0, pourRemaining = 0
     var creamRemaining = 0, creamEmitted = 0
     var time: Float = 0
+    var speedReference: Float = 18 // conservative until the first stats arrive
+    var lastSteps = 0
     var metadata: [String: Any] = [:]
     var surfaceDirty = true
     init(level: Float, device: MTLDevice) {
@@ -71,7 +74,8 @@ final class Fluid {
         let f = Fluid.filmCells
         let sizes = [Fluid.slots * 80, n*4, Fluid.slots*4, n*4, n*16, n*16,
                      n*4, n*4, n*4, n*4, 128, Fluid.surfaceCells*16, 256, 16, 80, 64,
-                     128, f*16, f*16, f*16, f*16, f*16, f*8, f*8, 64*16]
+                     128, f*16, f*16, f*16, f*16, f*16, f*8, f*8, 64*16,
+                     n*16, n*16, n*4, 64] // 25 face open fractions, 26 scratch, 27 red/black liquid lists, 28 counts + indirect args
         buffers = sizes.map { size in
             guard let buffer = device.makeBuffer(length: size, options: .storageModeShared) else { fail("fluid allocation failed") }
             memset(buffer.contents(), 0, size)
@@ -120,6 +124,16 @@ final class Fluid {
         encoder.setBytes(params, length: params.count*4, index: 10)
         encoder.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: min(128,pipeline.maxTotalThreadsPerThreadgroup),height:1,depth:1))
+        encoder.memoryBarrier(scope: .buffers)
+    }
+    // Threadgroup counts come from fluidIndirect (128-wide groups over a GPU-built list).
+    func dispatchIndirect(_ name: String, _ offset: Int, _ params: [Float], _ encoder: MTLComputeCommandEncoder) {
+        let pipeline = pipelines[name]!
+        encoder.setComputePipelineState(pipeline)
+        for i in 0..<buffers.count where i != 10 { encoder.setBuffer(buffers[i], offset: 0, index: i) }
+        encoder.setBytes(params, length: params.count*4, index: 10)
+        encoder.dispatchThreadgroups(indirectBuffer: buffers[28], indirectBufferOffset: offset,
+                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
         encoder.memoryBarrier(scope: .buffers)
     }
     func encode(_ frame: [String: Any], _ u: [Float], render: Bool, command: MTLCommandBuffer) {
@@ -177,22 +191,39 @@ final class Fluid {
         guard let encoder=command.makeComputeCommandEncoder() else {fail("fluid encoder")}
         dispatch("cupEvents",1,p,encoder)
         dispatch("fluidEvents",allocated,p,encoder)
-        let steps = dt>0 ? max(1,Int(ceil(dt/(1/360)))) : 0
+        // Adaptive substeps: dt_sub = min(1/120, 0.8 DX / v_max), v_max from the
+        // previous frame's particles and the cup's surface speed. The reference
+        // rises instantly and decays over a few frames; impulses pre-arm it so a
+        // knock's first frame is already finely stepped.
+        let body = buffers[14].contents().bindMemory(to:Float.self, capacity:20)
+        let cupSpeed = sqrt(body[8]*body[8]+body[9]*body[9]+body[10]*body[10])
+            + 1.1*sqrt(body[12]*body[12]+body[13]*body[13]+body[14]*body[14])
+        let measured = max(cupSpeed, (metadata["max_speed"] as? NSNumber)?.floatValue ?? 18)
+        speedReference = max(measured, speedReference*0.8)
+        if knock > 0 || poke > 0 { speedReference = max(speedReference, 18) }
+        let gridDX: Float = 0.085
+        let substep = min(1/120, 0.8*gridDX/max(speedReference, 1e-3))
+        let steps = dt>0 ? min(Int(ceil(dt*480)), max(1,Int(ceil(dt/substep)))) : 0
         if steps>0 {
-            p[0]=dt/Float(steps)
+            p[0]=dt/Float(steps);lastSteps=steps
+            p[23]=min(24, gridDX/p[0])
             for _ in 0..<steps {
                 time += p[0];p[5]=time
                 dispatch("cupStep",1,p,encoder)
                 dispatch("fluidClear",Fluid.cells,p,encoder)
                 dispatch("fluidBins",allocated,p,encoder)
                 dispatch("fluidP2G",Fluid.cells,p,encoder)
+                dispatch("fluidIndirect",1,p,encoder)
+                dispatch("fluidVorticity",Fluid.cells,p,encoder)
                 dispatch("fluidForces",Fluid.cells,p,encoder)
                 dispatch("fluidDivergence",Fluid.cells,p,encoder)
-                for _ in 0..<24 {
-                    p[12]=0;dispatch("fluidPressure",Fluid.cells,p,encoder)
-                    p[12]=1;dispatch("fluidPressure",Fluid.cells,p,encoder)
+                for _ in 0..<40 {
+                    p[12]=0;dispatchIndirect("fluidPressure",16,p,encoder)
+                    p[12]=1;dispatchIndirect("fluidPressure",32,p,encoder)
                 }
                 dispatch("fluidProject",Fluid.cells,p,encoder)
+                p[22]=0;dispatch("fluidExtrapolate",Fluid.cells,p,encoder)
+                p[22]=1;dispatch("fluidExtrapolate",Fluid.cells,p,encoder)
                 dispatch("fluidReaction",Fluid.cells,p,encoder)
                 dispatch("fluidG2P",allocated,p,encoder)
             }
@@ -276,6 +307,7 @@ final class Fluid {
         let filmQuantumVolume:Float=particleVolume/(8*4096)
         out["max_film_depth"]=Float(a[46])*filmQuantumVolume/(filmCellWidth*filmCellWidth)
         out["ripple_height"]=Float(a[42])/1e8
+        out["substeps"]=lastSteps
         metadata=out
         return out
     }
