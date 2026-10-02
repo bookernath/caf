@@ -109,7 +109,7 @@ float fresnelRough(float nv,float f0,float rough) {
 }
 // Value noise averaged toward its mean once a cell is under ~2 pixels wide.
 float filteredNoise(float2 p,float footprint) {
-    return mix(noise(p),.5,smoothstep(.35f,.9f,footprint));
+    return mix(noise(p),.5,smoothstep(.5f,1.5f,footprint));
 }
 // fw: world-space pixel footprint at the hit, used to band-limit patterns.
 float3 material(float3 p, int mat, float fw, device const float *u, CupBody body) {
@@ -261,7 +261,7 @@ float3 shadeHit(float3 p,float3 rd,int mat,float fp, device const float *u,devic
         }
         n=normalize(n-rotateQ(body.rotation,float3(gradient.x,0,gradient.y)));
     }
-    float fw=fp/max(.2f,abs(dot(rd,n)));
+    float fw=fp/max(.35f,abs(dot(rd,n)));
     float3 base=stainColor(material(p,mat,fw,u,body),coating);
     float milk=0.;
     if(mat==2 && real) {
