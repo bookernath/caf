@@ -52,11 +52,11 @@ do {
     let source = try "#define CAF_SCENE_LAYOUT 5\n" + String(contentsOf: sceneURL, encoding: .utf8) + "\n" + String(contentsOf: shaderURL, encoding: .utf8) + "\n" + String(contentsOf: fluidURL, encoding: .utf8) + "\n" + String(contentsOf: detailURL, encoding: .utf8)
     let library = try device.makeLibrary(source: source, options: nil)
     for name in ["coffeePrep", "coffee", "coffeeEdges", "coffeeResolve", "fluidClear", "fluidBins", "fluidP2G", "fluidForces", "fluidDivergence",
-                 "fluidPressure", "fluidProject", "fluidIndirect", "fluidVorticity", "fluidExtrapolate", "fluidG2P", "fluidEvents", "fluidSurface", "fluidStats", "fluidGridStats", "cupEvents", "cupStep", "fluidReaction", "fluidBreakup", "filmGather", "filmFlux", "filmAdvance", "filmCommit", "filmStats"] {
+                 "fluidSolve", "fluidProject", "fluidVorticity", "fluidExtrapolate", "fluidG2P", "fluidEvents", "fluidSurface", "fluidStats", "fluidGridStats", "cupEvents", "cupStep", "fluidReaction", "fluidBreakup", "filmGather", "filmFlux", "filmAdvance", "filmCommit", "filmStats"] {
         guard let function = library.makeFunction(name: name) else { fail("missing kernel \(name)") }
         pipelines[name] = try device.makeComputePipelineState(function: function)
     }
-    if pipelines["fluidPressure"]!.maxTotalThreadsPerThreadgroup < 128 { fail("fluidPressure needs 128-wide threadgroups") }
+    if pipelines["fluidSolve"]!.maxTotalThreadsPerThreadgroup < 256 { fail("fluidSolve needs 256-wide threadgroups") }
 } catch { fail(String(describing: error)) }
 
 final class Fluid {
@@ -75,7 +75,9 @@ final class Fluid {
         let sizes = [Fluid.slots * 80, n*4, Fluid.slots*4, n*4, n*16, n*16,
                      n*4, n*4, n*4, n*4, 128, Fluid.surfaceCells*16, 256, 16, 80, 64,
                      128, f*16, f*16, f*16, f*16, f*16, f*8, f*8, 64*16,
-                     n*16, n*16, n*4, 64] // 25 face open fractions, 26 scratch, 27 red/black liquid lists, 28 counts + indirect args
+                     n*16, n*16, n*4, 64, n*36, (28*16*28+14*8*14)*32]
+        // 25 face open fractions, 26 scratch, 27 red/black liquid lists, 28 counts,
+        // 29 pressure matrix + level set + CG vectors, 30 multigrid levels
         buffers = sizes.map { size in
             guard let buffer = device.makeBuffer(length: size, options: .storageModeShared) else { fail("fluid allocation failed") }
             memset(buffer.contents(), 0, size)
@@ -126,14 +128,15 @@ final class Fluid {
                                 threadsPerThreadgroup: MTLSize(width: min(128,pipeline.maxTotalThreadsPerThreadgroup),height:1,depth:1))
         encoder.memoryBarrier(scope: .buffers)
     }
-    // Threadgroup counts come from fluidIndirect (128-wide groups over a GPU-built list).
-    func dispatchIndirect(_ name: String, _ offset: Int, _ params: [Float], _ encoder: MTLComputeCommandEncoder) {
+    // The pressure solve is one threadgroup: CG + V-cycle synchronise with
+    // threadgroup barriers instead of hundreds of dependent dispatches.
+    func dispatchGroup(_ name: String, _ params: [Float], _ encoder: MTLComputeCommandEncoder) {
         let pipeline = pipelines[name]!
         encoder.setComputePipelineState(pipeline)
         for i in 0..<buffers.count where i != 10 { encoder.setBuffer(buffers[i], offset: 0, index: i) }
         encoder.setBytes(params, length: params.count*4, index: 10)
-        encoder.dispatchThreadgroups(indirectBuffer: buffers[28], indirectBufferOffset: offset,
-                                     threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        let width = min(1024, pipeline.maxTotalThreadsPerThreadgroup) / pipeline.threadExecutionWidth * pipeline.threadExecutionWidth
+        encoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
         encoder.memoryBarrier(scope: .buffers)
     }
     func encode(_ frame: [String: Any], _ u: [Float], render: Bool, command: MTLCommandBuffer) {
@@ -183,7 +186,7 @@ final class Fluid {
         var p = [Float](repeating:0,count:32)
         p[1]=gravity[0];p[2]=gravity[1];p[3]=gravity[2];p[4]=Float(allocated)
         p[5]=time;p[6]=max(0,min(1,stirNumber.floatValue));p[7]=u[4];p[8]=Float(sip);p[9]=min(13.3,poke)
-        p[10]=Float(newStart);p[11]=Float(allocated);p[13]=1.65
+        p[10]=Float(newStart);p[11]=Float(allocated)
         p[14]=min(11.1,knock);p[15]=(frame["cup_motion"] as? Bool ?? true) ? 1:0
         p[16]=Float(milkStart);p[17]=Float(allocated);p[18]=Float(fullCount);p[20]=dt
         guard let blit=command.makeBlitCommandEncoder() else {fail("fluid clear encoder")}
@@ -213,14 +216,10 @@ final class Fluid {
                 dispatch("fluidClear",Fluid.cells,p,encoder)
                 dispatch("fluidBins",allocated,p,encoder)
                 dispatch("fluidP2G",Fluid.cells,p,encoder)
-                dispatch("fluidIndirect",1,p,encoder)
                 dispatch("fluidVorticity",Fluid.cells,p,encoder)
                 dispatch("fluidForces",Fluid.cells,p,encoder)
                 dispatch("fluidDivergence",Fluid.cells,p,encoder)
-                for _ in 0..<40 {
-                    p[12]=0;dispatchIndirect("fluidPressure",16,p,encoder)
-                    p[12]=1;dispatchIndirect("fluidPressure",32,p,encoder)
-                }
+                dispatchGroup("fluidSolve",p,encoder)
                 dispatch("fluidProject",Fluid.cells,p,encoder)
                 p[22]=0;dispatch("fluidExtrapolate",Fluid.cells,p,encoder)
                 p[22]=1;dispatch("fluidExtrapolate",Fluid.cells,p,encoder)
@@ -308,6 +307,9 @@ final class Fluid {
         out["max_film_depth"]=Float(a[46])*filmQuantumVolume/(filmCellWidth*filmCellWidth)
         out["ripple_height"]=Float(a[42])/1e8
         out["substeps"]=lastSteps
+        out["solve_iterations"]=Float(a[49])/Float(max(1,a[51]));out["solve_iterations_max"]=Int(a[50])
+        out["solve_residual"]=Float(a[52])/1e6
+        out["divergence_raw"]=Float(a[53])/1000/Float(max(1,a[54]))
         metadata=out
         return out
     }

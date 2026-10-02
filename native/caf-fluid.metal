@@ -30,15 +30,57 @@ float bspline(float v) {
 float weight(float3 d) { return bspline(d.x)*bspline(d.y)*bspline(d.z); }
 float3 faceOffset(int a) { float3 v=float3(.5); v[a]=0.; return v; }
 constant int HALF_CELLS=CELLS/2;
-// Open area fraction of cell c's lower face on axis a, from the analytic SDF at
-// the face centre (0 = closed). Computed once per substep in fluidP2G; the
-// solver currently treats any open fraction as fully open.
+// Multigrid levels for the pressure preconditioner (56->28->14).
+constant int3 GRID1=int3(28,16,28),GRID2=int3(14,8,14);
+constant int CELLS1=28*16*28,CELLS2=14*8*14;
+constant int SOLVE_ITERATIONS=40;
+constant float SOLVE_TOLERANCE=.0005; // RMS divergence residual, 1/s
+constant int COARSE_SWEEPS=8;
+constant float THETA_MIN=.25;
+constant float COARSE_GAIN=1.;
+// Per coarse cell: lower-face weights + Dirichlet diagonal, unknown, rhs,
+// residual; `list` holds the level's red (from 0) / black (from end) lists.
+struct MGCell { float4 w; float x,b,r; int list; };
+// Solver buffer (29): float4 coefficients[CELLS], then float phi, r, z, d, q.
+device float *solverVector(device float4 *solver,int k) { return reinterpret_cast<device float *>(solver+CELLS)+k*CELLS; }
+// Open area fraction of cell c's lower face on axis a (0 = closed), from a
+// planar fit of the cup SDF across the DX square. Recomputed every substep in
+// fluidP2G; weights the pressure matrix and divergence (variational cut cells).
 float faceFraction(int3 c,int a,device const int *type,CupBody body) {
     int3 left=c;left[a]-=1;
     if(!inGrid(left))return 1.;
+    // Walls are ~1.1 cells thick, so a face spanning one always has a solid
+    // cell centre beside it: this keeps thin walls leak-proof.
     if(type[cellIndex(c)]==1 || type[cellIndex(left)]==1)return 0.;
-    float d=solidDistance(ORIGIN+(float3(c)+faceOffset(a))*DX,body);
-    return d<.005?0.:clamp(.5+d/DX,0.f,1.f);
+    float3 x=ORIGIN+(float3(c)+faceOffset(a))*DX;
+    float cup=cupShape(cupLocal(x,body)),fixed=fixedSolid(x),d=min(cup,fixed);
+    // The flat table/saucer stay binary: sub-cell weights there only let
+    // spilled films slip through the projection laterally and clump.
+    if(fixed<=cup)return d<.005?0.:1.;
+    if(d>DX)return 1.;
+    float3 n=solidNormal(x,body);
+    float spread=.5*DX*(abs(n[(a+1)%3])+abs(n[(a+2)%3]));
+    float f=spread<1e-4?(d>0.?1.:0.):clamp(.5+.5*d/spread,0.f,1.f);
+    return f<.05?0.:f;
+}
+// Signed distance (cells, + into air) of a cell centre from a flat surface,
+// given its fill fraction: inverts the quadratic B-spline's smoothed step.
+float fillDistance(float f) {
+    if(f<=1./6.)return 1.5-pow(6.*max(f,0.f),1./3.);
+    if(f>=5./6.)return pow(6.*max(1.-f,0.f),1./3.)-1.5;
+    float d=(.5-f)/.75;
+    for(int k=0;k<3;k++)d-=(.75*d-d*d*d/3.-(.5-f))/(.75-d*d);
+    return d;
+}
+// Ghost fluid: the fraction of the liquid-air centre spacing that is liquid,
+// from the coarse level set. Pressure unknowns stay every particle cell, so
+// sub-cell films stay incompressible. theta >= 0.25, not 0.01: cells barely
+// inside (or outside) the level set would pin p ~ 0, so a plunging pour or
+// cream stream splats on the surface instead of penetrating, and the top
+// layer can no longer carry a denser plume's weight.
+float ghostTheta(float liquid,float air) {
+    if(air<=0. || air<=liquid)return 1.;
+    return clamp(liquid/(liquid-air),THETA_MIN,1.f);
 }
 bool blocked(int3 c,int a,device const float4 *open) {
     int3 left=c;left[a]-=1;
@@ -77,22 +119,17 @@ kernel void fluidP2G(device const FluidParticle *particles [[buffer(0)]],device 
                      device int *type [[buffer(6)]],device float *pressure [[buffer(8)]],
                      device float *cream [[buffer(9)]],device const CupBody &body [[buffer(14)]],
                      device float4 *open [[buffer(25)]],device int *fluidList [[buffer(27)]],
-                     device atomic_uint *counters [[buffer(28)]],uint i [[thread_position_in_grid]]) {
+                     device atomic_uint *counters [[buffer(28)]],device float4 *solver [[buffer(29)]],uint i [[thread_position_in_grid]]) {
     if(i>=CELLS)return;
+    device float *phi=solverVector(solver,0);
     velocity[i]=0.;mass[i]=0.;cream[i]=0.;
     if(type[i]!=1)for(int j=heads[i];j>=0;j=next[j])
         if(particles[j].cx.w<=0.){type[i]=2;break;}
     int3 c=cellCoord(i);
-    if(type[i]!=2)pressure[i]=0.;
-    else {
-        // Red/black lists: pressure sweeps touch only liquid cells (~1%).
-        int color=(c.x+c.y+c.z)&1;
-        fluidList[color*HALF_CELLS+int(atomic_fetch_add_explicit(counters+color,1,memory_order_relaxed))]=int(i);
-    }
-    if(!active[i]){open[i]=1.;return;}
+    if(!active[i]){open[i]=1.;phi[i]=1.5*DX;pressure[i]=0.;return;}
     open[i]=float4(faceFraction(c,0,type,body),faceFraction(c,1,type,body),faceFraction(c,2,type,body),0.);
     float3 center=cellCenter(c);
-    float3 momentum=0.,weights=0.;float density=0.,creamMass=0.;
+    float3 momentum=0.,weights=0.;float density=0.,creamMass=0.,share=0.;
     for(int z=-2;z<=1;z++)for(int y=-2;y<=1;y++)for(int x=-2;x<=1;x++) {
         int3 bucket=c+int3(x,y,z);if(!inGrid(bucket))continue;
         for(int j=heads[cellIndex(bucket)];j>=0;j=next[j]) {
@@ -111,10 +148,20 @@ kernel void fluidP2G(device const FluidParticle *particles [[buffer(0)]],device 
     }
     velocity[i]=float4(momentum/max(weights,float3(1e-8)),0.);
     mass[i]=float4(weights,density);cream[i]=creamMass/max(density,1e-8f);
-}
-kernel void fluidIndirect(device uint *counters [[buffer(28)]],uint i [[thread_position_in_grid]]) {
-    if(i)return;
-    for(int color=0;color<2;color++){counters[4+4*color]=max(1u,(counters[color]+127)/128);counters[5+4*color]=1;counters[6+4*color]=1;}
+    // Coarse surface level set for the ghost-fluid boundary. The fill is
+    // normalised by the kernel's non-solid share, so liquid against a wall
+    // reads as full rather than as a free surface.
+    for(int z=-1;z<=1;z++)for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++) {
+        int3 q=c+int3(x,y,z);
+        if(!inGrid(q)||type[cellIndex(q)]!=1)share+=weight(float3(x,y,z));
+    }
+    phi[i]=fillDistance(density/(8.*max(share,.25f)))*DX;
+    if(type[i]!=2)pressure[i]=0.;
+    else {
+        // Red/black lists: the pressure solve touches only liquid cells (~1%).
+        int color=(c.x+c.y+c.z)&1;
+        fluidList[color*HALF_CELLS+int(atomic_fetch_add_explicit(counters+color,1,memory_order_relaxed))]=int(i);
+    }
 }
 float gridDensity(int3 c,device const float4 *mass) {
     return inGrid(c)?mass[cellIndex(c)].w:0.;
@@ -234,10 +281,40 @@ float divergenceAt(int3 c,device const float4 *v) {
     for(int a=0;a<3;a++) {int3 q=c;q[a]++;sum+=(inGrid(q)?v[cellIndex(q)][a]:v[i][a])-v[i][a];}
     return sum/DX;
 }
+// Variational (Batty) divergence: each face's flux is its open share of the
+// liquid velocity plus the closed share moving with the wall.
+float faceFlux(int3 c,int a,device const float4 *v,device const float4 *open,CupBody body) {
+    float f=open[cellIndex(c)][a],u=v[cellIndex(c)][a];
+    return f>=1.?u:f*u+(1.-f)*solidFace(c,a,body)[a];
+}
+float cutDivergence(int3 c,device const float4 *v,device const float4 *open,CupBody body) {
+    float sum=0.;int i=cellIndex(c);
+    for(int a=0;a<3;a++) {
+        int3 q=c;q[a]++;
+        sum+=(inGrid(q)?faceFlux(q,a,v,open,body):v[i][a])-faceFlux(c,a,v,open,body);
+    }
+    return sum/DX;
+}
+bool solveCell(int i,device const int *type) { return type[i]==2; }
+// Divergence target and matrix coefficients: lower-face weights (open area,
+// liquid on both sides) and the Dirichlet diagonal open/theta toward air.
 kernel void fluidDivergence(device const float4 *v [[buffer(4)]],device const int *type [[buffer(6)]],
                             device const float4 *mass [[buffer(5)]],device const float *s [[buffer(10)]],
-                            device float *divergence [[buffer(7)]],uint i [[thread_position_in_grid]]) {
+                            device float *divergence [[buffer(7)]],device const float4 *open [[buffer(25)]],
+                            device float4 *solver [[buffer(29)]],device const CupBody &body [[buffer(14)]],
+                            uint i [[thread_position_in_grid]]) {
     if(i>=CELLS)return;
+    device const float *phi=solverVector(solver,0);
+    if(!solveCell(i,type)){solver[i]=0.;divergence[i]=0.;return;}
+    int3 c=cellCoord(i);float4 w=float4(0,0,0,1e-4); // tiny shift: enclosed pockets stay SPD
+    for(int a=0;a<3;a++)for(int direction=-1;direction<=1;direction+=2) {
+        int3 q=c;q[a]+=direction;int3 face=direction>0?q:c;
+        float f=inGrid(face)?open[cellIndex(face)][a]:1.;
+        if(f<=0.)continue;
+        if(inGrid(q)&&solveCell(cellIndex(q),type)){if(direction<0)w[a]=f;}
+        else w.w+=f/(inGrid(q)?ghostTheta(phi[i],phi[cellIndex(q)]):1.);
+    }
+    solver[i]=w;
     // Particle/grid methods accumulate compression from wall projection and
     // source emission. Remove density drift rather than preserving particle
     // COUNT while the occupied liquid volume quietly collapses. A rate (1/s),
@@ -246,43 +323,204 @@ kernel void fluidDivergence(device const float4 *v [[buffer(4)]],device const in
     // Superlinear in the excess: secondary flow converging on a stirred vortex's
     // axis (the tea-leaf effect) piles particles faster than a linear rate fixes.
     float drift=min(60.f,excess*DRIFT_RATE*(1.+6.*excess));
-    divergence[i]=type[i]==2?divergenceAt(cellCoord(i),v)-drift:0.;
+    divergence[i]=cutDivergence(c,v,open,body)-drift;
 }
-// Red/black SOR over compact per-colour liquid lists (indirect dispatch):
-// opposite parity is read-only during each dispatch; the host inserts a GPU
-// buffer barrier between colours, so there are no neighbor races.
-kernel void fluidPressure(device const int *type [[buffer(6)]],device const float *divergence [[buffer(7)]],
-                          device float *pressure [[buffer(8)]],device const float *s [[buffer(10)]],
-                          device const float4 *open [[buffer(25)]],device const int *fluidList [[buffer(27)]],
-                          device const uint *counters [[buffer(28)]],uint t [[thread_position_in_grid]]) {
-    int color=int(s[12]);
-    if(t>=counters[color])return;
-    int i=fluidList[color*HALF_CELLS+int(t)];int3 c=cellCoord(i);
-    float sum=0.,diagonal=0.;
-    for(int a=0;a<3;a++)for(int direction=-1;direction<=1;direction+=2) {
-        int3 q=c;q[a]+=direction;
-        int3 face=direction>0?q:c;
-        if(blocked(face,a,open))continue;
-        diagonal+=1.;
-        if(inGrid(q)&&type[cellIndex(q)]==2)sum+=pressure[cellIndex(q)]; // air is p=0
+// MGPCG pressure solve in one threadgroup: threadgroup barriers replace the
+// per-sweep dispatches. Preconditioner: Galerkin V-cycle over piecewise-
+// constant aggregation (coarse face weight = summed child face weights) with
+// symmetric red/black Gauss-Seidel, so CG sees a fixed SPD operator.
+#define SYNC threadgroup_barrier(mem_flags::mem_device|mem_flags::mem_threadgroup)
+#define FOR(n) for(uint k=t;k<uint(n);k+=T)
+float groupSum(float v,threadgroup float *partial,uint lane,uint warp,uint warps) {
+    v=simd_sum(v);if(lane==0)partial[warp]=v;
+    SYNC;
+    float total=0.;for(uint k=0;k<warps;k++)total+=partial[k];
+    SYNC;
+    return total;
+}
+// Off-diagonal sum (sum w_j v_j) and diagonal of fine row i.
+float fineRow(int i,device const float4 *coef,device const float *v,thread float &diagonal) {
+    int3 c=cellCoord(i);float4 w=coef[i];float sum=0.;diagonal=w.w+w.x+w.y+w.z;
+    const int sy=GRID.x,sz=GRID.x*GRID.y;
+    if(w.x>0.)sum+=w.x*v[i-1];
+    if(w.y>0.)sum+=w.y*v[i-sy];
+    if(w.z>0.)sum+=w.z*v[i-sz];
+    if(c.x+1<GRID.x){float u=coef[i+1].x;diagonal+=u;if(u>0.)sum+=u*v[i+1];}
+    if(c.y+1<GRID.y){float u=coef[i+sy].y;diagonal+=u;if(u>0.)sum+=u*v[i+sy];}
+    if(c.z+1<GRID.z){float u=coef[i+sz].z;diagonal+=u;if(u>0.)sum+=u*v[i+sz];}
+    return sum;
+}
+float fineDiagonal(int i,device const float4 *coef) {
+    int3 c=cellCoord(i);float4 w=coef[i];float diagonal=w.w+w.x+w.y+w.z;
+    if(c.x+1<GRID.x)diagonal+=coef[i+1].x;
+    if(c.y+1<GRID.y)diagonal+=coef[i+GRID.x].y;
+    if(c.z+1<GRID.z)diagonal+=coef[i+GRID.x*GRID.y].z;
+    return diagonal;
+}
+int3 levelCoord(int i,int3 g) { return int3(i%g.x,(i/g.x)%g.y,i/(g.x*g.y)); }
+int levelIndex(int3 c,int3 g) { return (c.z*g.y+c.y)*g.x+c.x; }
+float coarseRow(device const MGCell *m,int i,int3 g,thread float &diagonal) {
+    int3 c=levelCoord(i,g);float4 w=m[i].w;float sum=0.;diagonal=w.w+w.x+w.y+w.z;
+    int sy=g.x,sz=g.x*g.y;
+    if(w.x>0.)sum+=w.x*m[i-1].x;
+    if(w.y>0.)sum+=w.y*m[i-sy].x;
+    if(w.z>0.)sum+=w.z*m[i-sz].x;
+    if(c.x+1<g.x){float u=m[i+1].w.x;diagonal+=u;if(u>0.)sum+=u*m[i+1].x;}
+    if(c.y+1<g.y){float u=m[i+sy].w.y;diagonal+=u;if(u>0.)sum+=u*m[i+sy].x;}
+    if(c.z+1<g.z){float u=m[i+sz].w.z;diagonal+=u;if(u>0.)sum+=u*m[i+sz].x;}
+    return sum;
+}
+int fineCell(device const int *list,int red,uint k) { return list[k<uint(red)?int(k):HALF_CELLS+int(k)-red]; }
+int coarseCell(device const MGCell *m,int count,int red,uint k) { return k<uint(red)?m[k].list:m[count-1-(int(k)-red)].list; }
+// Red/black Gauss-Seidel: colour 0 = red list, 1 = black list.
+void coarseSweep(device MGCell *m,int count,int2 n,int color,uint t,uint T,int3 g) {
+    FOR(color?n.y:n.x) {
+        int i=coarseCell(m,count,n.x,color?k+uint(n.x):k);float diagonal;
+        float sum=coarseRow(m,i,g,diagonal);m[i].x=(m[i].b+sum)/diagonal;
     }
-    if(diagonal>0.) {
-        float target=(sum-divergence[i]*DX*DX/s[0])/diagonal;
-        pressure[i]=mix(pressure[i],target,s[13]);
-    } else pressure[i]=0.;
+    SYNC;
 }
+void fineSweep(device const int *list,int red,int black,int color,device const float4 *coef,
+               device const float *rhs,device float *z,uint t,uint T) {
+    FOR(color?black:red) {
+        int i=list[color*HALF_CELLS+int(k)];float diagonal;
+        float sum=fineRow(i,coef,z,diagonal);z[i]=(rhs[i]+sum)/diagonal;
+    }
+    SYNC;
+}
+// Coarse level from its finer level: Galerkin R A P with piecewise-constant P.
+// Internal child faces cancel; external ones sum into the coarse face weight.
+template<typename Fine>
+void buildLevel(device MGCell *m,int count,int3 g,Fine fine,int3 fg,threadgroup atomic_int *counts,uint t,uint T) {
+    FOR(count) {
+        int3 c=levelCoord(int(k),g)*2;float4 w=0.;
+        for(int o=0;o<8;o++) {
+            float4 child=fine(levelIndex(c+int3(o&1,(o>>1)&1,o>>2),fg));
+            w.w+=child.w;if(!(o&1))w.x+=child.x;if(!(o&2))w.y+=child.y;if(!(o&4))w.z+=child.z;
+        }
+        m[k].w=w;m[k].x=0.;
+        if(w.w>0.) {
+            int3 cc=levelCoord(int(k),g);int color=(cc.x+cc.y+cc.z)&1;
+            int slot=atomic_fetch_add_explicit(counts+color,1,memory_order_relaxed);
+            m[color?count-1-slot:slot].list=int(k);
+        }
+    }
+}
+struct FineWeights { device const float4 *coef; float4 operator()(int i) const { return coef[i]; } };
+struct CoarseWeights { device const MGCell *m; float4 operator()(int i) const { return m[i].w; } };
+// z = M^-1 r. Pre-smoothing red,black from zero; post-smoothing black,red.
+void vcycle(device const int *list,int red,int black,device const float4 *coef,device const float *r,
+            device float *z,device float *q,device MGCell *m1,int2 n1,device MGCell *m2,int2 n2,uint t,uint T) {
+    FOR(red+black){int i=fineCell(list,red,k);z[i]=k<uint(red)?r[i]/fineDiagonal(i,coef):0.;}
+    SYNC;
+    fineSweep(list,red,black,1,coef,r,z,t,T);
+    FOR(red+black){int i=fineCell(list,red,k);float diagonal;float sum=fineRow(i,coef,z,diagonal);q[i]=r[i]-(diagonal*z[i]-sum);}
+    SYNC;
+    FOR(n1.x+n1.y) {
+        int I=coarseCell(m1,CELLS1,n1.x,k);int3 c=levelCoord(I,GRID1)*2;float b=0.;
+        for(int o=0;o<8;o++){int i=cellIndex(c+int3(o&1,(o>>1)&1,o>>2));if(coef[i].w>0.)b+=q[i];}
+        m1[I].b=b;m1[I].x=0.;
+    }
+    SYNC;
+    coarseSweep(m1,CELLS1,n1,0,t,T,GRID1);
+    coarseSweep(m1,CELLS1,n1,1,t,T,GRID1);
+    FOR(n1.x+n1.y){int I=coarseCell(m1,CELLS1,n1.x,k);float diagonal;float sum=coarseRow(m1,I,GRID1,diagonal);m1[I].r=m1[I].b-(diagonal*m1[I].x-sum);}
+    SYNC;
+    FOR(n2.x+n2.y) {
+        int I=coarseCell(m2,CELLS2,n2.x,k);int3 c=levelCoord(I,GRID2)*2;float b=0.;
+        for(int o=0;o<8;o++){int j=levelIndex(c+int3(o&1,(o>>1)&1,o>>2),GRID1);if(m1[j].w.w>0.)b+=m1[j].r;}
+        m2[I].b=b;m2[I].x=0.;
+    }
+    SYNC;
+    // Symmetric (forward then reverse) sweeps on the 14^3 level.
+    for(int sweep=0;sweep<COARSE_SWEEPS;sweep++)coarseSweep(m2,CELLS2,n2,(sweep<COARSE_SWEEPS/2?sweep:sweep+1)&1,t,T,GRID2);
+    FOR(n1.x+n1.y){int I=coarseCell(m1,CELLS1,n1.x,k);m1[I].x+=COARSE_GAIN*m2[levelIndex(levelCoord(I,GRID1)/2,GRID2)].x;}
+    SYNC;
+    coarseSweep(m1,CELLS1,n1,1,t,T,GRID1);
+    coarseSweep(m1,CELLS1,n1,0,t,T,GRID1);
+    FOR(red+black){int i=fineCell(list,red,k);z[i]+=COARSE_GAIN*m1[levelIndex(cellCoord(i)/2,GRID1)].x;}
+    SYNC;
+    fineSweep(list,red,black,1,coef,r,z,t,T);
+    fineSweep(list,red,black,0,coef,r,z,t,T);
+}
+kernel void fluidSolve(device const float *divergence [[buffer(7)]],
+                       device float *pressure [[buffer(8)]],device const float *s [[buffer(10)]],
+                       device atomic_uint *stats [[buffer(12)]],device const int *list [[buffer(27)]],
+                       device const uint *counters [[buffer(28)]],device float4 *solver [[buffer(29)]],
+                       device MGCell *mg [[buffer(30)]],
+                       uint t [[thread_index_in_threadgroup]],uint T [[threads_per_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]],uint warp [[simdgroup_index_in_threadgroup]],
+                       uint warps [[simdgroups_per_threadgroup]]) {
+    threadgroup float partial[32];threadgroup atomic_int counts[4];
+    device const float4 *coef=solver;
+    device float *r=solverVector(solver,1),*z=solverVector(solver,2),*d=solverVector(solver,3),*q=solverVector(solver,4);
+    device float *x=pressure; // warm start: last substep's pressure, 0 off the liquid
+    device MGCell *m1=mg,*m2=mg+CELLS1;
+    int red=int(counters[0]),black=int(counters[1]);uint n=uint(red+black);
+    if(t<4)atomic_store_explicit(counts+t,0,memory_order_relaxed);
+    SYNC;
+    buildLevel(m1,CELLS1,GRID1,FineWeights{coef},GRID,counts,t,T);
+    SYNC;
+    buildLevel(m2,CELLS2,GRID2,CoarseWeights{m1},GRID1,counts+2,t,T);
+    float scale=DX*DX/s[0],local=0.;
+    FOR(n) {
+        int i=fineCell(list,red,k);float diagonal;
+        float sum=fineRow(i,coef,x,diagonal);
+        r[i]=-divergence[i]*scale-(diagonal*x[i]-sum);local+=r[i]*r[i];
+    }
+    float rr=groupSum(local,partial,lane,warp,warps);
+    int2 n1=int2(atomic_load_explicit(counts,memory_order_relaxed),atomic_load_explicit(counts+1,memory_order_relaxed));
+    int2 n2=int2(atomic_load_explicit(counts+2,memory_order_relaxed),atomic_load_explicit(counts+3,memory_order_relaxed));
+    float limit=SOLVE_TOLERANCE*SOLVE_TOLERANCE*scale*scale*float(n);
+    int iterations=0;
+    if(rr>limit) {
+        vcycle(list,red,black,coef,r,z,q,m1,n1,m2,n2,t,T);
+        local=0.;FOR(n){int i=fineCell(list,red,k);d[i]=z[i];local+=r[i]*z[i];}
+        float rz=groupSum(local,partial,lane,warp,warps);
+        while(iterations<SOLVE_ITERATIONS) {
+            iterations++;
+            local=0.;
+            FOR(n){int i=fineCell(list,red,k);float diagonal;float sum=fineRow(i,coef,d,diagonal);q[i]=diagonal*d[i]-sum;local+=d[i]*q[i];}
+            float alpha=rz/max(groupSum(local,partial,lane,warp,warps),1e-30f);
+            local=0.;
+            FOR(n){int i=fineCell(list,red,k);x[i]+=alpha*d[i];r[i]-=alpha*q[i];local+=r[i]*r[i];}
+            rr=groupSum(local,partial,lane,warp,warps);
+            if(rr<=limit)break;
+            vcycle(list,red,black,coef,r,z,q,m1,n1,m2,n2,t,T);
+            local=0.;FOR(n){int i=fineCell(list,red,k);local+=r[i]*z[i];}
+            float rzNew=groupSum(local,partial,lane,warp,warps),beta=rzNew/max(rz,1e-30f);rz=rzNew;
+            FOR(n){int i=fineCell(list,red,k);d[i]=z[i]+beta*d[i];}
+            SYNC;
+        }
+    }
+    if(t==0) {
+        atomic_fetch_add_explicit(stats+49,uint(iterations),memory_order_relaxed);
+        atomic_fetch_max_explicit(stats+50,uint(iterations),memory_order_relaxed);
+        atomic_fetch_add_explicit(stats+51,1,memory_order_relaxed);
+        atomic_fetch_max_explicit(stats+52,uint(min(1e9f,sqrt(rr/max(1.f,float(n)))/scale*1e6)),memory_order_relaxed);
+    }
+}
+#undef FOR
+#undef SYNC
 kernel void fluidProject(device float4 *v [[buffer(4)]],device const int *type [[buffer(6)]],
                          device const float *pressure [[buffer(8)]],device const float *s [[buffer(10)]],
                          device const uint *active [[buffer(3)]],device const float4 *open [[buffer(25)]],
+                         device float4 *solver [[buffer(29)]],
                          device const CupBody &body [[buffer(14)]],uint i [[thread_position_in_grid]]) {
     if(i>=CELLS||!active[i])return;int3 c=cellCoord(i);float3 vel=v[i].xyz;
+    device const float *phi=solverVector(solver,0);
     for(int a=0;a<3;a++) {
         int3 q=c;q[a]--;
         if(blocked(c,a,open)){vel[a]=solidFace(c,a,body)[a];continue;}
-        int lt=inGrid(q)?type[cellIndex(q)]:0, rt=type[i];
-        if(lt!=2&&rt!=2)continue;
-        float pl=lt==2?pressure[cellIndex(q)]:0.,pr=rt==2?pressure[i]:0.;
-        vel[a]-=(pr-pl)*s[0]/DX;
+        bool lq=inGrid(q)&&solveCell(cellIndex(q),type),li=solveCell(i,type);
+        if(!lq&&!li)continue;
+        // Ghost fluid: air pressure is zero at the interpolated surface, not
+        // at the air cell's centre, so waves are not snapped to cells.
+        float gradient;
+        if(lq&&li)gradient=pressure[i]-pressure[cellIndex(q)];
+        else if(li)gradient=pressure[i]/(inGrid(q)?ghostTheta(phi[i],phi[cellIndex(q)]):1.);
+        else gradient=-pressure[cellIndex(q)]/ghostTheta(phi[cellIndex(q)],phi[i]);
+        vel[a]-=gradient*s[0]/DX;
     }
     v[i]=float4(vel,0.);
 }
@@ -293,7 +531,7 @@ kernel void fluidProject(device float4 *v [[buffer(4)]],device const int *type [
 bool faceKnown(int3 c,int a,device const int *type,device const float4 *open) {
     if(blocked(c,a,open))return true;
     int3 q=c;q[a]--;
-    return type[cellIndex(c)]==2 || (inGrid(q)&&type[cellIndex(q)]==2);
+    return solveCell(cellIndex(c),type) || (inGrid(q)&&solveCell(cellIndex(q),type));
 }
 kernel void fluidExtrapolate(device float4 *v [[buffer(4)]],device float4 *scratch [[buffer(26)]],
                              device const int *type [[buffer(6)]],device const uint *active [[buffer(3)]],
@@ -532,13 +770,20 @@ kernel void fluidStats(device const FluidParticle *particles [[buffer(0)]],devic
     }
 }
 kernel void fluidGridStats(device const float4 *v [[buffer(4)]],device const int *type [[buffer(6)]],
-                           device const float4 *mass [[buffer(5)]],
+                           device const float4 *mass [[buffer(5)]],device const float4 *open [[buffer(25)]],
                            device const float *divergence [[buffer(7)]],device atomic_uint *stats [[buffer(12)]],
+                           device float4 *solver [[buffer(29)]],
                            device const CupBody &body [[buffer(14)]],uint i [[thread_position_in_grid]]) {
     if(i>=CELLS||type[i]!=2)return;
-    atomic_fetch_add_explicit(stats+11,uint(min(100000.f,abs(divergence[i])*1000.)),memory_order_relaxed);
-    atomic_fetch_add_explicit(stats+12,uint(min(100000.f,abs(divergenceAt(cellCoord(i),v))*1000.)),memory_order_relaxed);
-    atomic_fetch_add_explicit(stats+13,1,memory_order_relaxed);
+    int3 c=cellCoord(i);
+    // Unweighted divergence over every particle cell (the pre-cut-cell metric).
+    atomic_fetch_add_explicit(stats+53,uint(min(100000.f,abs(divergenceAt(c,v))*1000.)),memory_order_relaxed);
+    atomic_fetch_add_explicit(stats+54,1,memory_order_relaxed);
+    if(solveCell(i,type)) {
+        atomic_fetch_add_explicit(stats+11,uint(min(100000.f,abs(divergence[i])*1000.)),memory_order_relaxed);
+        atomic_fetch_add_explicit(stats+12,uint(min(100000.f,abs(cutDivergence(c,v,open,body))*1000.)),memory_order_relaxed);
+        atomic_fetch_add_explicit(stats+13,1,memory_order_relaxed);
+    }
     atomic_fetch_max_explicit(stats+27,uint(mass[i].w*1000.),memory_order_relaxed);
     atomic_fetch_add_explicit(stats+28,1,memory_order_relaxed);
     if(mass[i].w>10.)atomic_fetch_add_explicit(stats+29,1,memory_order_relaxed);
@@ -549,18 +794,20 @@ kernel void fluidGridStats(device const float4 *v [[buffer(4)]],device const int
 // impulses account for contacts below grid resolution; this handles bulk load.
 kernel void fluidReaction(device const int *type [[buffer(6)]],device const float *pressure [[buffer(8)]],
                           device const float *s [[buffer(10)]],device const CupBody &body [[buffer(14)]],
-                          device const float4 *open [[buffer(25)]],
+                          device const float4 *open [[buffer(25)]],device float4 *solver [[buffer(29)]],
                           device atomic_int *reaction [[buffer(15)]],uint i [[thread_position_in_grid]]) {
-    if(i>=CELLS || type[i]!=2 || body.position.w<.5)return;
+    if(i>=CELLS || body.position.w<.5 || !solveCell(i,type))return;
     int3 c=cellCoord(i);
     float density=.25/(s[18]*.0425*.0425*.0425);
     for(int a=0;a<3;a++)for(int direction=-1;direction<=1;direction+=2) {
         int3 face=c;if(direction>0)face[a]++;
-        if(!blocked(face,a,open))continue;
+        // The closed share of a cut face carries the traction.
+        float closed=inGrid(face)?1.-open[cellIndex(face)][a]:0.;
+        if(closed<=0.)continue;
         float3 p=ORIGIN+(float3(face)+faceOffset(a))*DX;
         if(!isCupContact(p,body))continue;
         float3 impulse=0.;
-        impulse[a]=float(direction)*clamp(pressure[i],0.f,100.f)*DX*DX*s[0]*density;
+        impulse[a]=float(direction)*clamp(pressure[i],0.f,100.f)*DX*DX*s[0]*density*closed;
         accumulateReaction(reaction,impulse,p-body.position.xyz);
     }
 }
