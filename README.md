@@ -14,11 +14,27 @@ On a terminal that **positively answers the Kitty graphics capability query**, `
 uses the optional Metal helper automatically. Otherwise it keeps the ANSI renderer;
 terminal names alone are not treated as proof of image support.
 
-- Ivory glazed ceramic, oxblood pinstripes, a resting foot and walnut tabletop.
-- Soft contact shadows, window/neon reflections, warm steam shafts and a free liquid surface.
-- Restrained red/teal diner neon and occasional passing-headlight sweeps; `l` toggles
-  them, or start with `--studio` for the simpler lighting.
+- Ivory ceramic as two layers: a diffuse body with wrap lighting and a warm
+  translucent glow through the thin rim and handle, under a sharp F0 .04 clearcoat
+  with faint orange peel and crazing; an unglazed foot ring and an old dried drip.
+- Varnished walnut planks (~4.5 cm, per-board tone) with domain-warped cathedral
+  growth rings, pore lines and an anisotropic sheen along the grain.
+- A spoon resting on the saucer and a sugar packet (render-only props; the liquid
+  and cup do not collide with them). Glaze, varnish and steel mirror each other.
+- Tight contact occlusion, window/neon reflections, a micro-bubble meniscus ring,
+  a thin-film oil sheen at grazing angles and a free liquid surface.
+- A ~35° lens with thin-lens depth of field: the room behind the table is an
+  analytically defocused diner (counter and stools, pie case, red neon sign, teal
+  OPEN tubes, street lamps through the window, bokeh discs).
+- Restrained red/teal diner neon and occasional passing-headlight sweeps, which
+  pass through the window mullions as a moving gobo; `l` toggles them, or start
+  with `--studio` for the simpler lighting.
+- Steam is domain-warped noise scrolling upward, eroded into wisps with height,
+  with Henyey-Greenstein forward scattering so it glows when backlit.
 - World-space steam follows both tilt axes; the steam-written clock still works.
+- Spilled films and residue absorb by Beer-Lambert over their depth (thin films
+  tan, pools dark), with a meniscus edge highlight and a darker coffee-ring edge
+  where the ever-wet footprint ends.
 - Fine, stable ordered dithering (`--smooth` swaps it for static ±1 LSB noise), not
   low-resolution upscaling.
 - GPU image pipeline: warm key + cool sky ambient, normalized GGX specular with
@@ -26,8 +42,10 @@ terminal names alone are not treated as proof of image support.
   self-shadowing, PBR Neutral shoulder tonemap and exact sRGB encoding (optional
   `"exposure"` request key, default 1). A still view accumulates Halton-jittered
   samples into a persistent history (neighbourhood-clipped; rejected when the surface
-  under a pixel changes); any camera or cup motion resets it, and those frames
-  supersample only material/depth edges instead.
+  under a pixel changes, or for rigid surfaces only when it changes to/from liquid
+  or spray); any camera or cup motion resets it, and those frames supersample only
+  material/depth edges instead. Every pattern is deterministic per pixel; depth of
+  field is analytic, so a still frame cannot shimmer.
 - Ambient light changes the warm/cool lighting balance. The camera rests by default;
   press `o` for auto-orbit.
 - Native resolution: the image is rendered at the terminal's real cell pixel size
@@ -147,7 +165,10 @@ modelled ~2.5% denser than hot coffee, so the pour plunges and spreads low until
 stirring lifts it. Stirring is a submerged spoon circling the cup plus a weak bulk
 swirl, with vorticity confinement and wall skin friction, so it sheds shear
 ribbons and spins down over seconds rather than painting concentric rings. A short
-absorption/scattering integration reveals cream below the surface. This is a
+absorption/scattering integration reveals cream below the surface: its scattering
+is seen through a softened coffee absorption, so a sunken cloud reads as a tan glow
+fading with depth, and albedo follows concentration (semi-infinite multiple
+scattering), so partly mixed regions are café-au-lait rather than chalk. This is a
 single-fluid concentration model with stylized optics, not a separate multiphase
 milk solver or a canned latte-art animation.
 
