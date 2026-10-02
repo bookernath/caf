@@ -24,7 +24,7 @@ terminal names alone are not treated as proof of image support.
   press `o` for auto-orbit.
 - Bounded 30 FPS target, up to 960×720 real pixels. Sensor samples are buffered
   independently of rendering. At 720×480 on the development Mac, the warm APIC +
-  rendering + readback/IPC + PNG pipeline measured **19.2 ms median / 20.5 ms p95**
+  rendering + readback/IPC + PNG pipeline measured **15.0 ms median / 20.8 ms p95**
   over 320 warm frames covering cream, stirring and a cup knock-over. Terminal transport, decoding and
   display are excluded; this is not a guaranteed end-to-end frame rate.
 - Missing helper, unavailable GPU, unsupported terminal or a failed render falls back
@@ -76,8 +76,14 @@ correction prevents particle bunching from silently shrinking the visible liquid
 The underlying pressure grid remains 56×32×56; this is still a finite-resolution
 real-time approximation, not film-grade splashes or a scientific CFD instrument.
 A model unit now represents **10 cm**: gravity and control impulses use mug-scale
-timing, with substeps at most 1/360 second. Floor drag is time-scaled, rather than
-applied repeatedly during collision projection. Small ripples and thin films
+timing. Substeps adapt to the previous frame's fastest liquid and cup surface
+speed (CFL 0.8, between 1/120 and 1/480 second; knocks pre-arm fine steps), and
+particles advect with a midpoint step so a swirl does not spiral outward. Pressure
+sweeps visit only liquid cells (GPU-built red/black lists, indirect dispatch), and
+solid face fractions are computed once per substep. Projected velocities are
+extended two cells into the air so surface particles never sample raw, unprojected
+faces. Floor drag is time-scaled, rather than applied repeatedly during collision
+projection. Small ripples and thin films
 below the grid resolution are still approximations.
 
 **Fine splashes have actual volume.** Sparse fast splash edges and rim drips can
@@ -107,8 +113,11 @@ only added cream scatters light. This is a real-time single-path approximation,
 not a full multiple-scattering/path-traced renderer.
 
 **Cream is transported, not painted.** A small moving pour adds cream-bearing
-particles. Concentration follows the flow, with gentle buoyancy and diffusion;
-stirring creates differential rotation instead of spinning a texture. A short
+particles. Concentration follows the flow with gentle diffusion. Cold cream is
+modelled ~2.5% denser than hot coffee, so the pour plunges and spreads low until
+stirring lifts it. Stirring is a submerged spoon circling the cup plus a weak bulk
+swirl, with vorticity confinement and wall skin friction, so it sheds shear
+ribbons and spins down over seconds rather than painting concentric rings. A short
 absorption/scattering integration reveals cream below the surface. This is a
 single-fluid concentration model with stylized optics, not a separate multiphase
 milk solver or a canned latte-art animation.
@@ -116,7 +125,8 @@ milk solver or a canned latte-art animation.
 **The cup is a moving rigid body.** Its foot, shell, rim and handle contact the
 saucer/table; the same transformed geometry drives rendering and liquid collision.
 Moving-wall velocities, pressure traction and collision impulses couple cup and
-coffee. Depending on knock direction, the handle may catch the saucer instead of
+coffee. A settled cup holds still under moderate tilt (static friction ≈0.7,
+solved before integration so it cannot creep). Depending on knock direction, the handle may catch the saucer instead of
 letting the cup fall over. Try `k` rather than shaking the laptop; orbiting changes
 the screen-relative knock direction. Use `--cup locked` to retain a fixed cup.
 There is no timed housekeeping or automatic refill. A rocking cup can recover
