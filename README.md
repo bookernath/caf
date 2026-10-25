@@ -473,6 +473,8 @@ change your existing privileges or sleep settings.
 python3 -B -m unittest discover -s tests -v
 # Also exercise actual GPU frames on a Mac with Metal access:
 CAF_TEST_METAL=1 python3 -B -m unittest discover -s tests -v
+# Check that a sensor bridge never outlives caf (needs an M2+ MacBook sensor):
+CAF_TEST_IMU=1 python3 -B -m unittest discover -s tests -k bridge_exits -v
 # Legacy GPU material preview: no sensors or power assertions:
 python3 -B tools/preview.py --output .build/diner.png
 # Reproducible APIC tilt/return snapshots and particle-accounting diagnostics:

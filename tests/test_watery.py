@@ -65,7 +65,11 @@ class Clock:
     def monotonic(self): return time.monotonic()+float(offset.read_text())
     def __getattr__(self,k): return getattr(time,k)
 g['time']=Clock()
-g['imu_start_bridge']=lambda:None
+class Bridge:
+    def poll(self): return None
+    def send_signal(self,sig): record('bridge',sig=sig.name)
+    def terminate(self): record('bridge',sig='SIGTERM')
+g['imu_start_bridge']=Bridge
 g['imu_read_sample']=lambda:None
 class Sensors:
     def __init__(self,*a): pass
@@ -137,6 +141,9 @@ raise SystemExit(g['main']())
                     if line.endswith("\n")
                 ]
 
+            def bridge():
+                return [r["sig"] for r in records() if r["kind"] == "bridge"]
+
             def pump(seconds):
                 nonlocal replied
                 end = time.monotonic() + seconds
@@ -179,6 +186,8 @@ raise SystemExit(g['main']())
                 frozen = [r for r in records() if r["kind"] == "frame"]
                 sounds_before_pause = [r for r in records() if r["kind"] == "sound"]
                 self.assertTrue(frozen)
+                # The 1 kHz bridge caf owns is frozen while blurred.
+                self.assertEqual(bridge(), ["SIGSTOP"])
                 output.clear()
                 os.write(master, b"m")  # accidental background input is not applied
                 update = offset.with_suffix(".new")
@@ -199,6 +208,7 @@ raise SystemExit(g['main']())
                     > len(frozen)
                 )
                 resumed = [r for r in records() if r["kind"] == "frame"][len(frozen)]
+                self.assertEqual(bridge(), ["SIGSTOP", "SIGCONT"])
                 self.assertLessEqual(resumed["t"] - frozen[-1]["t"], 1 / 30 + 1e-6)
                 self.assertLessEqual(resumed["sim"] - frozen[-1]["sim"], 1 / 30 + 1e-5)
                 self.assertNotIn("cream", [e["kind"] for e in resumed["events"]])
@@ -224,6 +234,8 @@ raise SystemExit(g['main']())
                 self.assertIn(b"\x1b[?1004l", output)
                 self.assertIn(b"\x1b[?1049l", output)
                 self.assertTrue(any(r["kind"] == "sensors_closed" for r in records()))
+                # Quit while blurred: TERM, then CONT so the stopped bridge sees it.
+                self.assertEqual(bridge()[-2:], ["SIGTERM", "SIGCONT"])
             finally:
                 if proc.poll() is None:
                     proc.kill()
@@ -236,6 +248,47 @@ raise SystemExit(g['main']())
     @unittest.skipUnless(os.getenv("CAF_TEST_METAL") == "1", "requires actual GPU")
     def test_real_gpu_focus_pause_resume(self):
         self.run_focus_session(real_gpu=True)
+
+    @unittest.skipUnless(os.getenv("CAF_TEST_IMU") == "1", "requires an M2+ sensor")
+    def test_spawned_bridge_exits_with_its_owner(self):
+        with tempfile.TemporaryDirectory() as d:
+            imu = Path(d) / "imu.dat"
+            owner = subprocess.Popen(
+                [sys.executable, "-B", "-c",
+                 "import subprocess,sys,time\n"
+                 "p=subprocess.Popen([sys.argv[1],'--imu-bridge','--quiet'])\n"
+                 "print(p.pid,flush=True)\ntime.sleep(60)",
+                 str(ROOT / "caf-art")],
+                stdout=subprocess.PIPE,
+                env=dict(os.environ, CAF_IMU_PATH=str(imu)),
+            )
+            bridge = int(owner.stdout.readline())
+            try:
+                end = time.monotonic() + 5
+                while time.monotonic() < end and not (
+                        imu.exists() and time.time() - imu.stat().st_mtime < 0.2):
+                    time.sleep(0.05)
+                self.assertTrue(imu.exists(), "bridge never streamed")
+                owner.kill()  # kill -9: no cleanup runs in the owner
+                owner.wait()
+                end = time.monotonic() + 3
+                while time.monotonic() < end:
+                    try:
+                        os.kill(bridge, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("bridge outlived its owner")
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait()
+                owner.stdout.close()
+                try:
+                    os.kill(bridge, 9)
+                except ProcessLookupError:
+                    pass
 
 
 @unittest.skipUnless(os.getenv("CAF_TEST_METAL") == "1", "requires actual GPU")

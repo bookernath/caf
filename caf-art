@@ -514,7 +514,7 @@ def render3d(scene):
 # renderer auto-detects fresh samples and turns real laptop motion into
 # physics: tilt slants the coffee, shoves slosh it, the gyro spins the camera.
 
-IMU_PATH = "/tmp/caf-imu.dat"
+IMU_PATH = os.getenv("CAF_IMU_PATH", "/tmp/caf-imu.dat")  # override: tests
 IMU_FMT = "<4sId8f"                   # magic, ver, t(f64), ax..gz, lux, checksum
 IMU_MAGIC = b"CIMU"
 
@@ -645,11 +645,14 @@ def imu_bridge(debug_secs=0, quiet=False):
         return cf.CFNumberCreate(None, 3, C.byref(C.c_int32(v)))
 
     def enable_streaming(svc):
-        """Wake the sensor: reporting on, power on, 1ms report interval."""
+        """Wake the sensor: reporting on, power on, 10ms report interval.
+
+        caf drains samples every ~8 ms, so 100 Hz loses nothing it can use;
+        1 ms reports cost the bridge ~10x the CPU in ctypes callbacks."""
         errs = 0
         for k, v in (("SensorPropertyReportingState", 1),
                      ("SensorPropertyPowerState", 1),
-                     ("ReportInterval", 1000)):
+                     ("ReportInterval", 10000)):
             if iokit.IORegistryEntrySetCFProperty(svc, cfstr(k), cfnum32(v)) != 0:
                 errs += 1
         return errs
