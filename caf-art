@@ -765,11 +765,19 @@ def imu_bridge(debug_secs=0, quiet=False):
     t_end = time.monotonic() + debug_secs if debug_secs else None
     last_dbg = 0.0
     published = 0
+    # A bridge spawned by caf (--quiet) must not outlive it: a crashed or
+    # kill -9'd caf otherwise leaves a 1 kHz HID reader running for days.
+    owner = os.getppid() if quiet else None
+    owner_check = 0.0
     try:
         while t_end is None or time.monotonic() < t_end:
             cf.CFRunLoopRunInMode(
                 C.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode"), 0.008, False)
             now = time.monotonic()
+            if owner is not None and now - owner_check > 1.0:
+                owner_check = now
+                if os.getppid() != owner:
+                    break
             if state["an"] != published:
                 imu_write_sample(fd, now, state["a"], state["g"], state["l"])
                 published = state["an"]
@@ -2628,6 +2636,7 @@ def main():
             caf_proc.terminate()
         if imu_proc:
             imu_proc.terminate()
+            imu_proc.send_signal(signal.SIGCONT)  # a stopped bridge must see TERM
         if old_termios is not None:
             import termios
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_termios)
@@ -2692,6 +2701,8 @@ def main():
     imu_prev_t = None
     imu_active = False
     imu_resuming = False
+    imu_seen_at = None       # last sample time; None until any bridge streams
+    imu_retry_at = 0.0
     win_prev = None          # (t, x, y) last window position report
     win_query_at = 0.0
     WIN_RE = re.compile(r"\x1b\[3;(-?\d+);(-?\d+)t")
@@ -2731,6 +2742,11 @@ def main():
                         focused = new_focus
                         if sensors:
                             sensors.set_paused(not focused)
+                        # Our own bridge reads HID at 1 kHz; freeze it while
+                        # unfocused. A shared bridge belongs to another caf.
+                        if imu_proc and imu_proc.poll() is None:
+                            imu_proc.send_signal(signal.SIGCONT if focused
+                                                 else signal.SIGSTOP)
                         if not focused and kit:
                             kit.close()  # stop existing incidental voices, keep kit reusable
                         scene.snd = kit.play if focused and kit and kit.ok else None
@@ -2740,6 +2756,8 @@ def main():
                         imu_active = False
                         scene.fluid_accel = (0., 0., 0.)
                         if focused:
+                            if imu_seen_at is not None:
+                                imu_seen_at = now  # grace for a resumed bridge
                             imu_resuming = True
                             prev_lines = prev_status = None
                     stdin_buf = re.sub(r"\x1b\[[IO]", "", stdin_buf)
@@ -2811,6 +2829,7 @@ def main():
                 if sample[3] >= 0.:
                     scene.ambient_light(sample[3], sample_dt)
                 imu_prev_t = sample[0]
+                imu_seen_at = now
                 imu_active = True
             if imu_active and (imu_prev_t is None or now-imu_prev_t >= .6):
                 scene.tilt_in = (0., 0.)
@@ -2818,6 +2837,13 @@ def main():
                 scene.gravity = (0., -1., 0.)
                 scene.fluid_accel = (0., 0., 0.)
                 imu_active = False
+            # A shared bridge exits (or freezes) with the caf that owns it; once
+            # this session has seen samples, take over rather than lose motion.
+            if (focused and imu_seen_at is not None and now-imu_seen_at >= 2.
+                    and now >= imu_retry_at
+                    and (imu_proc is None or imu_proc.poll() is not None)):
+                imu_retry_at = now + 5.
+                imu_proc = imu_start_bridge()
 
             # pomodoro drives the level
             extra = ""
