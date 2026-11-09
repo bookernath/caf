@@ -2386,6 +2386,7 @@ class Scene:
 
 # Encoding and Kitty escapes live in caf_graphics (kitty_png/kitty_shm).
 kitty_emit = kitty_png
+SYNC_BEGIN, SYNC_END = "\x1b[?2026h", "\x1b[?2026l"
 
 
 def px_to_png(px, W, H):
@@ -2644,6 +2645,7 @@ def main():
             import termios
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_termios)
         if interactive:
+            sys.stdout.write(SYNC_END)  # an interrupted frame must not leave it on
             sys.stdout.write("\x1b_Ga=d,d=I,i=99,q=2;\x1b\\" if S or gpu else "")
             if keyboard:
                 sys.stdout.write("\x1b[?1004l")
@@ -2693,6 +2695,9 @@ def main():
 
     focused = True  # unsupported terminals keep running; never guess focus
     last_size = None
+    # Escapes queued for the next frame, so they land inside its
+    # synchronized update instead of painting a blank screen on their own.
+    pending = ""
     frame_n = 0
     prev_lines = None
     prev_status = None
@@ -2903,7 +2908,7 @@ def main():
                 last_size = (cols, rows)
                 prev_lines = prev_status = None
                 if interactive:
-                    sys.stdout.write("\x1b[2J")
+                    pending += "\x1b[2J"
                 scene.particles = [p for p in scene.particles
                                    if p[1] < scene.cup_top + scene.rim_h]
 
@@ -2911,7 +2916,9 @@ def main():
             if cols < 26 or rows < 10:
                 if interactive:
                     msg = f"{scene.theme['icon']} zzz… (terminal too small, still caffeinated)"
-                    sys.stdout.write(f"\x1b[H\x1b[2J\x1b[{rows // 2};1H" + msg[:cols].center(cols))
+                    sys.stdout.write(f"{SYNC_BEGIN}{pending}\x1b[H\x1b[2J\x1b[{rows // 2};1H"
+                                     + msg[:cols].center(cols) + SYNC_END)
+                    pending = ""
                     sys.stdout.flush()
                     time.sleep(0.5)
                     scene.t += 0.5
@@ -2969,7 +2976,7 @@ def main():
                     last_size = None
                     prev_lines = prev_status = None
                     scene.layout(cols, rows)
-                    sys.stdout.write("\x1b_Ga=d,d=I,i=99,q=2;\x1b\\\x1b[2J")
+                    pending += "\x1b_Ga=d,d=I,i=99,q=2;\x1b\\\x1b[2J"
                     extra += " · GPU stopped; CPU fallback"
             if image is None:
                 px, sgrid = scene.draw()
@@ -2997,6 +3004,13 @@ def main():
                     buf = "".join(parts)
                 prev_lines, prev_status = lines, status
                 prev_sparkle_rows = {r for _, r, _ in scene.sparkles}
+            # Synchronized output (DEC mode 2026): the terminal presents the
+            # whole frame at once instead of painting a half-replaced image
+            # or a cleared screen. Terminals without it ignore the mode.
+            buf = pending + buf
+            pending = ""
+            if interactive:
+                buf = SYNC_BEGIN + buf + SYNC_END
             sys.stdout.write(buf)
             sys.stdout.flush()
             if gpu and hasattr(gpu, "note_frame"):
